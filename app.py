@@ -8,7 +8,7 @@ warnings.filterwarnings('ignore')
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Bridgewater Knock-Off",
+    page_title="Project All-Weather",
     page_icon="🌦",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -254,8 +254,34 @@ hr { border-color: var(--border) !important; }
 # DATA LAYER
 # ══════════════════════════════════════════════════════════════════════════════
 
-CORE_ASSETS   = ["VOO", "TLT", "IEF", "GLD", "GSG"]
-CORE_COLORS   = ["#3b82f6", "#10b981", "#8b5cf6", "#f59e0b", "#ef4444"]
+# Age-adjusted core: equity-dominant, gold as inflation hedge, minimal bonds
+# Glide path shifts this composition as time horizon shrinks
+CORE_COLORS   = ["#3b82f6", "#10b981", "#f59e0b", "#a78bfa", "#ef4444"]
+
+# Glide path presets — bond weight increases, equity decreases with age
+GLIDE_PRESETS = {
+    "31–40 · Aggressive Growth": {
+        "assets": ["VOO", "VEA", "VWO", "GLD"],
+        "description": "Pure equity + gold. Zero bond drag. Max compounding window.",
+    },
+    "41–50 · Growth": {
+        "assets": ["VOO", "VEA", "VWO", "GLD", "IEF"],
+        "description": "Adding mid-term bonds (~10% weight). Begin reducing sequence risk.",
+    },
+    "51–55 · Growth / Conservative": {
+        "assets": ["VOO", "VEA", "GLD", "IEF", "TLT"],
+        "description": "Reduced intl. exposure, adding long bonds (~20%). Capital preservation begins.",
+    },
+    "56–60 · Conservative": {
+        "assets": ["VOO", "GLD", "IEF", "TLT", "GSG"],
+        "description": "Transitioning to full risk parity. Drawdown protection priority.",
+    },
+    "60+ · All-Weather Classic": {
+        "assets": ["VOO", "TLT", "IEF", "GLD", "GSG"],
+        "description": "Original Bridgewater All-Weather. Designed for capital preservation.",
+    },
+}
+
 SECTOR_ETFS   = {
     "XLE": "Energy",       "XLK": "Technology",    "XLV": "Health Care",
     "XLF": "Financials",   "XLI": "Industrials",   "XLY": "Cons. Disc.",
@@ -272,13 +298,15 @@ QUADRANT_MAP = {
 }
 
 DEMO_PRICES = {
-    "VOO": 480.0, "TLT": 94.0,  "IEF": 98.0,  "GLD": 225.0, "GSG": 19.5,
+    "VOO": 480.0, "VEA": 52.0,  "VWO": 43.0,  "GLD": 225.0,
+    "TLT": 94.0,  "IEF": 98.0,  "GSG": 19.5,
     "XLE": 89.0,  "XLK": 222.0, "XLV": 141.0, "XLF": 44.0,  "XLI": 119.0,
     "XLY": 191.0, "XLP": 77.0,  "XLB": 88.0,  "XLC": 91.0,  "XLU": 68.0,
     "XLRE": 42.0, "BIL": 91.5,  "SH": 14.0,   "VIXY": 25.0,
 }
 DEMO_VOLS = {
-    "VOO": 0.155, "TLT": 0.135, "IEF": 0.065, "GLD": 0.115, "GSG": 0.225,
+    "VOO": 0.155, "VEA": 0.165, "VWO": 0.185, "GLD": 0.115,
+    "TLT": 0.135, "IEF": 0.065, "GSG": 0.225,
 }
 
 def _make_demo_prices(tickers, n=260):
@@ -381,8 +409,25 @@ with st.sidebar:
                                  max_value=10_000_000, value=100_000, step=1000,
                                  format="%d")
     st.markdown("---")
+    st.markdown("##### 🎯 Glide Path — Life Stage")
+    glide_choice = st.selectbox(
+        "Select your age bracket",
+        options=list(GLIDE_PRESETS.keys()),
+        index=0,
+        help="Core asset composition shifts with your time horizon. As you age, bond exposure increases and equity exposure decreases."
+    )
+    glide_cfg  = GLIDE_PRESETS[glide_choice]
+    CORE_ASSETS = glide_cfg["assets"]
+    st.markdown(f"""
+    <div style="background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.2);
+                border-radius:5px;padding:10px 12px;font-size:0.75rem;color:var(--muted);
+                margin-top:4px">
+      {glide_cfg['description']}
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown("---")
     st.markdown("##### Bucket Weights")
-    core_pct    = st.slider("Core All-Weather %", 40, 80, 60, 5)
+    core_pct    = st.slider("Core Equity %", 40, 80, 60, 5)
     tactical_pct= st.slider("Tactical Pure Alpha %", 10, 40, 30, 5)
     hedge_pct   = 100 - core_pct - tactical_pct
     st.markdown(f"Hedge (auto) **{hedge_pct}%**")
@@ -397,11 +442,12 @@ st.markdown(f"""
 <div class="aw-header">
   <span style="font-size:2rem">🌦</span>
   <div>
-    <h1>Bridgewater Knock-Off</h1>
+    <h1>PROJECT ALL-WEATHER</h1>
     <div style="margin-top:4px;display:flex;gap:8px">
-      <span class="aw-badge">RISK PARITY</span>
+      <span class="aw-badge">EQUITY CORE</span>
       <span class="aw-badge" style="background:#10b981">PURE ALPHA</span>
       <span class="aw-badge" style="background:#f59e0b">TAIL HEDGE</span>
+      <span class="aw-badge" style="background:#8b5cf6">{glide_choice.split('·')[0].strip()}</span>
     </div>
   </div>
   <div style="margin-left:auto;text-align:right;font-family:var(--mono);font-size:0.7rem;color:var(--muted)">
@@ -415,7 +461,9 @@ st.markdown(f"""
 # ══════════════════════════════════════════════════════════════════════════════
 
 with st.spinner("Fetching market data…"):
-    all_tickers = CORE_ASSETS + list(SECTOR_ETFS.keys()) + list(HEDGE_ASSETS.keys()) + ["VOO"]
+    # Always fetch all possible core tickers across all glide path stages
+    ALL_POSSIBLE_CORE = ["VOO", "VEA", "VWO", "GLD", "TLT", "IEF", "GSG"]
+    all_tickers = ALL_POSSIBLE_CORE + list(SECTOR_ETFS.keys()) + list(HEDGE_ASSETS.keys())
     all_tickers = list(dict.fromkeys(all_tickers))
 
     try:
@@ -434,13 +482,23 @@ if not data_ok:
     st.stop()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PART 1 — CORE ALL-WEATHER (Risk Parity)
+# PART 1 — CORE EQUITY (Age-Adjusted Risk Parity)
 # ══════════════════════════════════════════════════════════════════════════════
 
 core_prices   = prices_all[[t for t in CORE_ASSETS if t in prices_all.columns]]
 core_weights  = compute_volatility_weights(core_prices)
-core_assets_w = {t: core_weights.get(t, 0.0) for t in CORE_ASSETS}
 core_bucket   = core_pct / 100
+
+# Human-readable core asset labels
+CORE_LABELS = {
+    "VOO": "US Equities (VOO)",
+    "VEA": "Intl Developed (VEA)",
+    "VWO": "Emerging Markets (VWO)",
+    "GLD": "Gold (GLD)",
+    "TLT": "Long-Term Bonds (TLT)",
+    "IEF": "Mid-Term Bonds (IEF)",
+    "GSG": "Commodities (GSG)",
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PART 2 — TACTICAL PURE ALPHA
@@ -643,7 +701,7 @@ with col_hedge_info:
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
 
-tab1, tab2, tab3 = st.tabs(["📊  ALLOCATION ENGINE", "📈  SECTOR MOMENTUM", "⚖  DRIFT REPORT"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊  ALLOCATION ENGINE", "📈  SECTOR MOMENTUM", "⚖  DRIFT REPORT", "🗺  GLIDE PATH"])
 
 # ─── TAB 1 — ALLOCATION ENGINE ───────────────────────────────────────────────
 with tab1:
@@ -651,10 +709,17 @@ with tab1:
 
     with c1:
         st.markdown('<div class="aw-card">', unsafe_allow_html=True)
-        st.markdown('<div class="aw-card-title">🏛 Core All-Weather (Risk Parity)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="aw-card-title">🏛 Core Equity Bucket (Risk Parity Weighted)</div>', unsafe_allow_html=True)
+
+        # Compute equity vs non-equity split for display
+        equity_tickers = [t for t in CORE_ASSETS if t in ["VOO","VEA","VWO"]]
+        equity_weight  = sum(core_weights.get(t, 0) for t in equity_tickers)
+
         st.markdown(f"""
         <div style="font-size:0.8rem;color:var(--muted);margin-bottom:16px">
-          Volatility-weighted across 4 economic quadrants · Bucket: <b style="color:var(--accent)">{core_pct}%</b>
+          Inv-vol weighted · Life stage: <b style="color:#8b5cf6">{glide_choice.split('·')[0].strip()}</b>
+          &nbsp;·&nbsp; Bucket: <b style="color:var(--accent)">{core_pct}%</b>
+          &nbsp;·&nbsp; Equity share: <b style="color:#10b981">{equity_weight*100:.0f}%</b> of core
         </div>
         """, unsafe_allow_html=True)
 
@@ -669,17 +734,25 @@ with tab1:
                      .dropna().tail(30).std() * np.sqrt(252)) if ticker in core_prices.columns else 0
             color = CORE_COLORS[i % len(CORE_COLORS)]
             pct_of_total = core_bucket * w * 100
+            label = CORE_LABELS.get(ticker, ticker)
+            is_equity = ticker in ["VOO","VEA","VWO"]
+            asset_type = "equity" if is_equity else ("bond" if ticker in ["TLT","IEF"] else "alt")
+            type_color = {"equity": "#10b981", "bond": "#3b82f6", "alt": "#f59e0b"}[asset_type]
             st.markdown(f"""
             <div class="alloc-bar-container">
               <div class="alloc-bar-label">
-                <span><b>{ticker}</b></span>
+                <span>
+                  <b>{ticker}</b>
+                  <span style="font-size:0.65rem;color:{type_color};margin-left:6px;
+                               font-family:var(--mono);text-transform:uppercase">{asset_type}</span>
+                </span>
                 <span style="color:var(--muted)">{pct_of_total:.1f}% · ${dollar:,.0f} · {shares} shares</span>
               </div>
               <div class="alloc-bar-track">
                 <div class="alloc-bar-fill" style="width:{w*100:.1f}%;background:{color}"></div>
               </div>
               <div style="font-size:0.65rem;color:var(--muted);margin-top:3px">
-                30d Vol: {vol*100:.1f}% · Inv-vol weight: {w*100:.1f}%
+                {label} · 30d Vol: {vol*100:.1f}% · Inv-vol weight: {w*100:.1f}%
               </div>
             </div>
             """, unsafe_allow_html=True)
@@ -761,7 +834,7 @@ with tab1:
         <div class="metric-tile">
           <div class="label">Core Bucket</div>
           <div class="value" style="color:#3b82f6">${total_inv*core_bucket:,.0f}</div>
-          <div class="sub">{core_pct}% · Risk Parity</div>
+          <div class="sub">{core_pct}% · {', '.join(CORE_ASSETS)}</div>
         </div>
         <div class="metric-tile">
           <div class="label">Tactical Bucket</div>
@@ -774,9 +847,9 @@ with tab1:
           <div class="sub">{hedge_pct}% · {hedge_ticker}</div>
         </div>
         <div class="metric-tile">
-          <div class="label">Regime</div>
-          <div class="value" style="color:#a78bfa;font-size:1rem">{quad_emoji} {quad_name}</div>
-          <div class="sub">GDP {gdp_trend} · CPI {cpi_trend}</div>
+          <div class="label">Life Stage</div>
+          <div class="value" style="color:#8b5cf6;font-size:0.85rem">{glide_choice.split('·')[0].strip()}</div>
+          <div class="sub">{quad_emoji} {quad_name} regime</div>
         </div>
       </div>
     </div>
@@ -905,7 +978,77 @@ with tab3:
     """, unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-# ── Footer ─────────────────────────────────────────────────────────────────────
+# ─── TAB 4 — GLIDE PATH ──────────────────────────────────────────────────────
+with tab4:
+    st.markdown('<div class="aw-card">', unsafe_allow_html=True)
+    st.markdown('<div class="aw-card-title">🗺 Glide Path — Asset Composition by Life Stage</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style="font-size:0.8rem;color:var(--muted);margin-bottom:24px">
+      As your time horizon shrinks, shift the core bucket composition rightward.
+      The tactical and hedge buckets remain unchanged throughout. Your current stage is highlighted.
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Build glide path timeline
+    stage_colors = ["#10b981","#3b82f6","#f59e0b","#f97316","#ef4444"]
+    for i, (stage, cfg) in enumerate(GLIDE_PRESETS.items()):
+        is_current = stage == glide_choice
+        border_col = stage_colors[i]
+        bg = f"rgba({','.join(str(int(border_col.lstrip('#')[j:j+2],16)) for j in (0,2,4))},0.10)" if is_current else "var(--surface2)"
+        assets = cfg["assets"]
+
+        # Classify assets for the mini bar
+        equity_a = [a for a in assets if a in ["VOO","VEA","VWO"]]
+        bond_a   = [a for a in assets if a in ["TLT","IEF"]]
+        alt_a    = [a for a in assets if a in ["GLD","GSG"]]
+        n = len(assets)
+        eq_w  = len(equity_a)/n*100
+        bond_w= len(bond_a)/n*100
+        alt_w = len(alt_a)/n*100
+
+        current_badge = f'<span style="background:{border_col};color:white;font-family:var(--mono);font-size:0.6rem;padding:2px 8px;border-radius:3px;letter-spacing:1px;margin-left:10px">CURRENT</span>' if is_current else ""
+
+        st.markdown(f"""
+        <div style="padding:18px 20px;background:{bg};border:1px solid {''+border_col if is_current else 'var(--border)'};
+                    border-radius:8px;margin-bottom:12px">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+            <div>
+              <b style="font-family:var(--mono);font-size:0.85rem;color:{'var(--text)' if is_current else 'var(--muted)'}">{stage}</b>
+              {current_badge}
+            </div>
+            <div style="font-size:0.75rem;color:var(--muted)">
+              {'→'.join(assets)}
+            </div>
+          </div>
+          <div style="height:10px;border-radius:5px;overflow:hidden;display:flex;margin-bottom:10px">
+            <div style="width:{eq_w}%;background:#10b981;transition:width 0.4s"></div>
+            <div style="width:{bond_w}%;background:#3b82f6"></div>
+            <div style="width:{alt_w}%;background:#f59e0b"></div>
+          </div>
+          <div style="display:flex;gap:16px;font-size:0.7rem;color:var(--muted);font-family:var(--mono)">
+            <span><span style="color:#10b981">■</span> Equity {eq_w:.0f}%</span>
+            <span><span style="color:#3b82f6">■</span> Bonds {bond_w:.0f}%</span>
+            <span><span style="color:#f59e0b">■</span> Alts {alt_w:.0f}%</span>
+            <span style="margin-left:auto;font-style:italic">{cfg['description']}</span>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div style="margin-top:20px;padding:16px 20px;background:rgba(139,92,246,0.08);
+                border:1px solid rgba(139,92,246,0.25);border-radius:8px;
+                font-size:0.8rem;color:var(--muted)">
+      <b style="color:#8b5cf6;font-family:var(--mono)">HOW TO USE THIS</b><br><br>
+      The glide path is a manual decision — there's no automatic trigger. Revisit your life stage
+      selection every 5–10 years, or after major life events (marriage, dependents, income change).
+      The tactical and hedge buckets <b style="color:var(--text)">stay at 30% / 10%</b> regardless of
+      life stage — only the core composition changes. When you shift stages, rebalance the core
+      bucket gradually over 2–3 quarters to avoid tax events from selling large positions at once.
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
 st.markdown(f"""
 <div style="margin-top:40px;padding-top:20px;border-top:1px solid var(--border);
             text-align:center;font-family:var(--mono);font-size:0.65rem;color:var(--muted)">
