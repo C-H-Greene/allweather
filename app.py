@@ -8,7 +8,7 @@ warnings.filterwarnings('ignore')
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Project All-Weather",
+    page_title="Bridgewater Knock-Off",
     page_icon="🌦",
     layout="wide",
     initial_sidebar_state="expanded",
