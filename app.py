@@ -397,7 +397,7 @@ st.markdown(f"""
 <div class="aw-header">
   <span style="font-size:2rem">🌦</span>
   <div>
-    <h1>PROJECT ALL-WEATHER</h1>
+    <h1>Bridgewater Knock-Off</h1>
     <div style="margin-top:4px;display:flex;gap:8px">
       <span class="aw-badge">RISK PARITY</span>
       <span class="aw-badge" style="background:#10b981">PURE ALPHA</span>
