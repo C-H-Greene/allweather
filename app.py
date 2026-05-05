@@ -14,6 +14,60 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PERSISTENCE — localStorage ↔ query_params bridge
+# On first load: JS reads localStorage → sets URL params → Streamlit re-runs
+# On save: JS writes current sidebar values back to localStorage
+# ══════════════════════════════════════════════════════════════════════════════
+
+PARAM_DEFAULTS = {
+    "total_inv":    "100000",
+    "glide_index":  "0",
+    "core_pct":     "60",
+    "tactical_pct": "30",
+}
+
+def _qp(key: str, default):
+    """Read a query param, falling back to default. Casts to int if default is int."""
+    val = st.query_params.get(key, str(default))
+    try:
+        return int(val) if isinstance(default, int) else val
+    except (ValueError, TypeError):
+        return default
+
+# Inject JS once: reads localStorage → pushes into URL params → triggers rerun
+st.components.v1.html("""
+<script>
+(function() {
+  const KEYS = ["total_inv","glide_index","core_pct","tactical_pct"];
+  const stored = {};
+  let needsUpdate = false;
+  const params = new URLSearchParams(window.parent.location.search);
+
+  KEYS.forEach(k => {
+    const v = localStorage.getItem("aw_" + k);
+    if (v !== null && params.get(k) !== v) {
+      stored[k] = v;
+      needsUpdate = true;
+    }
+  });
+
+  if (needsUpdate) {
+    KEYS.forEach(k => { if (stored[k] !== undefined) params.set(k, stored[k]); });
+    // Replace URL without full reload; Streamlit picks up query_params on next interaction
+    window.parent.history.replaceState(null, "", "?" + params.toString());
+  }
+})();
+</script>
+""", height=0)
+
+# Read persisted values (or defaults) from query params
+_total_inv_default    = _qp("total_inv",    100_000)
+_glide_index_default  = _qp("glide_index",  0)
+_core_pct_default     = _qp("core_pct",     60)
+_tactical_pct_default = _qp("tactical_pct", 30)
+
+
 # ── Styling ────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -405,19 +459,27 @@ def sma(prices: pd.Series, window: int) -> float:
 
 with st.sidebar:
     st.markdown("### ⚙ Parameters")
-    total_inv = st.number_input("Total Investment ($)", min_value=1000,
-                                 max_value=10_000_000, value=100_000, step=1000,
-                                 format="%d")
+
+    total_inv = st.number_input(
+        "Total Investment ($)",
+        min_value=1000, max_value=10_000_000,
+        value=_total_inv_default,
+        step=1000, format="%d"
+    )
     st.markdown("---")
     st.markdown("##### 🎯 Glide Path — Life Stage")
+
+    glide_keys   = list(GLIDE_PRESETS.keys())
+    glide_index  = min(_glide_index_default, len(glide_keys) - 1)
     glide_choice = st.selectbox(
         "Select your age bracket",
-        options=list(GLIDE_PRESETS.keys()),
-        index=0,
-        help="Core asset composition shifts with your time horizon. As you age, bond exposure increases and equity exposure decreases."
+        options=glide_keys,
+        index=glide_index,
+        help="Core asset composition shifts with your time horizon."
     )
-    glide_cfg  = GLIDE_PRESETS[glide_choice]
+    glide_cfg   = GLIDE_PRESETS[glide_choice]
     CORE_ASSETS = glide_cfg["assets"]
+
     st.markdown(f"""
     <div style="background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.2);
                 border-radius:5px;padding:10px 12px;font-size:0.75rem;color:var(--muted);
@@ -427,12 +489,45 @@ with st.sidebar:
     """, unsafe_allow_html=True)
     st.markdown("---")
     st.markdown("##### Bucket Weights")
-    core_pct    = st.slider("Core Equity %", 40, 80, 60, 5)
-    tactical_pct= st.slider("Tactical Pure Alpha %", 10, 40, 30, 5)
-    hedge_pct   = 100 - core_pct - tactical_pct
+
+    core_pct     = st.slider("Core Equity %",        40, 80, _core_pct_default,     5)
+    tactical_pct = st.slider("Tactical Pure Alpha %", 10, 40, _tactical_pct_default, 5)
+    hedge_pct    = 100 - core_pct - tactical_pct
     st.markdown(f"Hedge (auto) **{hedge_pct}%**")
     st.markdown("---")
-    run_btn = st.button("🔄  REFRESH DATA", use_container_width=True)
+
+    # ── Save to localStorage ───────────────────────────────────────────────
+    save_btn = st.button("💾  SAVE SETTINGS", use_container_width=True)
+    run_btn  = st.button("🔄  REFRESH DATA",  use_container_width=True)
+
+    if save_btn:
+        new_glide_index = glide_keys.index(glide_choice)
+        # Write to query params (Streamlit side)
+        st.query_params["total_inv"]    = str(total_inv)
+        st.query_params["glide_index"]  = str(new_glide_index)
+        st.query_params["core_pct"]     = str(core_pct)
+        st.query_params["tactical_pct"] = str(tactical_pct)
+        # Write to localStorage (browser side)
+        st.components.v1.html(f"""
+        <script>
+        localStorage.setItem("aw_total_inv",    "{total_inv}");
+        localStorage.setItem("aw_glide_index",  "{new_glide_index}");
+        localStorage.setItem("aw_core_pct",     "{core_pct}");
+        localStorage.setItem("aw_tactical_pct", "{tactical_pct}");
+        </script>
+        """, height=0)
+        st.success("✓ Settings saved — will persist on next visit.", icon="💾")
+
+    # Show last-saved indicator
+    st.markdown(f"""
+    <div style="font-family:var(--mono);font-size:0.62rem;color:var(--muted);
+                margin-top:8px;text-align:center">
+      Loaded from: {'💾 saved prefs' if any(
+          st.query_params.get(k) for k in PARAM_DEFAULTS
+      ) else '⚙ defaults'}
+    </div>
+    """, unsafe_allow_html=True)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HEADER
