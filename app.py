@@ -1295,6 +1295,8 @@ with tab3:
     st.markdown('</div>', unsafe_allow_html=True)
 
 
+# ─── TAB 4 — GLIDE PATH ──────────────────────────────────────────────────────
+with tab4:
     st.markdown('<div class="aw-card">', unsafe_allow_html=True)
     st.markdown('<div class="aw-card-title">🗺 Glide Path — Asset Composition by Life Stage</div>', unsafe_allow_html=True)
     st.markdown("""
