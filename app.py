@@ -428,6 +428,108 @@ def fetch_fred_macro():
 
     return gdp_trend, cpi_trend, gdp_vals, cpi_vals
 
+# Sector → search keywords for GDELT headline matching
+SECTOR_KEYWORDS = {
+    "XLE":  ["energy", "oil", "gas", "petroleum", "OPEC", "crude"],
+    "XLK":  ["technology", "semiconductor", "AI", "software", "chip", "tech"],
+    "XLV":  ["healthcare", "pharma", "biotech", "drug", "FDA", "hospital"],
+    "XLF":  ["bank", "finance", "interest rate", "Fed", "credit", "lending"],
+    "XLI":  ["industrial", "manufacturing", "defense", "aerospace", "infrastructure"],
+    "XLY":  ["consumer", "retail", "spending", "discretionary", "e-commerce"],
+    "XLP":  ["staples", "grocery", "food", "beverage", "household", "consumer goods"],
+    "XLB":  ["materials", "mining", "steel", "copper", "chemical", "commodity"],
+    "XLC":  ["media", "telecom", "streaming", "advertising", "social", "communication"],
+    "XLU":  ["utility", "electricity", "power grid", "renewable", "water"],
+    "XLRE": ["real estate", "REIT", "housing", "mortgage", "property"],
+}
+
+@st.cache_data(ttl=1800)
+def fetch_gdelt_sentiment(tickers: list) -> dict:
+    """
+    Query GDELT GKG (Global Knowledge Graph) API for recent news tone
+    around each sector. Returns dict of {ticker: {score, tone, count, headlines}}.
+
+    GDELT Article Search API — free, no key required.
+    Tone: negative = bearish coverage, positive = bullish coverage.
+    Range roughly -100 (extremely negative) to +100 (extremely positive).
+    Real-world sector scores typically fall between -8 and +4.
+    """
+    import urllib.request, json, urllib.parse
+    from datetime import datetime, timedelta
+
+    results = {}
+    base_url = "https://api.gdeltproject.org/api/v2/doc/doc"
+
+    # Look back 7 days for recency
+    end_dt   = datetime.utcnow()
+    start_dt = end_dt - timedelta(days=7)
+    timespan = "1week"
+
+    for ticker in tickers:
+        keywords = SECTOR_KEYWORDS.get(ticker, [ticker])
+        # Use top 2 keywords joined as OR query — keeps results broad but relevant
+        query_str = " OR ".join(f'"{k}"' for k in keywords[:2])
+
+        params = urllib.parse.urlencode({
+            "query":    query_str,
+            "mode":     "artlist",
+            "maxrecords": 25,
+            "format":   "json",
+            "timespan": timespan,
+            "sourcelang": "english",
+        })
+        url = f"{base_url}?{params}"
+
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                raw = json.loads(r.read().decode("utf-8", errors="ignore"))
+
+            articles = raw.get("articles", [])
+            if not articles:
+                raise ValueError("no articles")
+
+            tones    = [float(a.get("socialimage", "0") or 0) for a in articles]
+            # GDELT tone is in the 'tone' field of ArtList; fallback gracefully
+            tones    = []
+            headlines = []
+            for a in articles:
+                t_val = a.get("tone", None)
+                if t_val is not None:
+                    try:
+                        tones.append(float(t_val))
+                    except (ValueError, TypeError):
+                        pass
+                title = a.get("title", "")
+                url_a = a.get("url", "")
+                if title:
+                    headlines.append({"title": title, "url": url_a})
+
+            if not tones:
+                raise ValueError("no tone data")
+
+            avg_tone = sum(tones) / len(tones)
+            # Normalise to -1 … +1 for display (typical range is ±10)
+            norm     = max(-1.0, min(1.0, avg_tone / 10.0))
+
+            results[ticker] = {
+                "score":     round(avg_tone, 2),
+                "norm":      round(norm, 3),
+                "count":     len(articles),
+                "tone_label": "Bullish" if norm > 0.1 else ("Bearish" if norm < -0.1 else "Neutral"),
+                "headlines": headlines[:5],
+                "error":     None,
+            }
+
+        except Exception as exc:
+            results[ticker] = {
+                "score": 0.0, "norm": 0.0, "count": 0,
+                "tone_label": "N/A", "headlines": [],
+                "error": str(exc),
+            }
+
+    return results
+
 def compute_volatility_weights(prices: pd.DataFrame) -> pd.Series:
     log_ret = np.log(prices / prices.shift(1)).dropna()
     vols    = log_ret.tail(30).std() * np.sqrt(252)
@@ -796,7 +898,13 @@ with col_hedge_info:
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
 
-tab1, tab2, tab3, tab4 = st.tabs(["📊  ALLOCATION ENGINE", "📈  SECTOR MOMENTUM", "⚖  DRIFT REPORT", "🗺  GLIDE PATH"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📊  ALLOCATION ENGINE",
+    "📈  SECTOR MOMENTUM",
+    "⚖  DRIFT REPORT",
+    "🗺  GLIDE PATH",
+    "📰  NARRATIVE RADAR",
+])
 
 # ─── TAB 1 — ALLOCATION ENGINE ───────────────────────────────────────────────
 with tab1:
@@ -996,85 +1104,197 @@ with tab3:
     st.markdown('<div class="aw-card-title">⚖ Drift Report — Current vs. Target Weights</div>', unsafe_allow_html=True)
     st.markdown("""
     <div style="font-size:0.8rem;color:var(--muted);margin-bottom:16px">
-      Enter your current holdings to see rebalancing actions required.
+      Enter your current holdings, then hit <b>💾 Save Holdings</b>.
+      Values persist in your browser — keyed by ticker so they survive
+      regime rotations that change the tactical sector selection.
     </div>
     """, unsafe_allow_html=True)
 
+    # ── Build target rows ──────────────────────────────────────────────────
     target_rows = []
     for ticker in CORE_ASSETS:
         if ticker not in core_weights.index:
             continue
-        w       = core_weights[ticker]
-        target  = core_bucket * w * 100
-        target_rows.append({"Ticker": ticker, "Bucket": "Core", "Target %": target})
+        w = core_weights[ticker]
+        target_rows.append({
+            "Ticker":   ticker,
+            "Bucket":   "Core",
+            "Label":    CORE_LABELS.get(ticker, ticker),
+            "Target %": round(core_bucket * w * 100, 2),
+        })
     for ticker in top3:
-        target_rows.append({"Ticker": ticker, "Bucket": "Tactical", "Target %": tactical_per_sector * 100})
-    target_rows.append({"Ticker": hedge_ticker, "Bucket": "Hedge", "Target %": hedge_pct})
+        target_rows.append({
+            "Ticker":   ticker,
+            "Bucket":   "Tactical",
+            "Label":    SECTOR_ETFS.get(ticker, ticker),
+            "Target %": round(tactical_per_sector * 100, 2),
+        })
+    target_rows.append({
+        "Ticker":   hedge_ticker,
+        "Bucket":   "Hedge",
+        "Label":    HEDGE_ASSETS.get(hedge_ticker, hedge_ticker),
+        "Target %": float(hedge_pct),
+    })
 
-    target_df = pd.DataFrame(target_rows)
-    target_df["Current %"] = 0.0  # default
+    target_df     = pd.DataFrame(target_rows)
+    drift_tickers = target_df["Ticker"].tolist()
 
+    # ── JS: on page load push any saved localStorage values into URL params ─
+    holdings_js_keys = ", ".join(f'"{t}"' for t in drift_tickers)
+    st.components.v1.html(f"""
+    <script>
+    (function() {{
+      const tickers = [{holdings_js_keys}];
+      const params  = new URLSearchParams(window.parent.location.search);
+      let changed   = false;
+      tickers.forEach(t => {{
+        const v = localStorage.getItem("aw_drift_" + t);
+        if (v !== null && params.get("drift_" + t) !== v) {{
+          params.set("drift_" + t, v);
+          changed = true;
+        }}
+      }});
+      if (changed) {{
+        window.parent.history.replaceState(null, "", "?" + params.toString());
+      }}
+    }})();
+    </script>
+    """, height=0)
+
+    # ── Load saved Current % from query_params ─────────────────────────────
+    def _load_holding(ticker: str) -> float:
+        val = st.query_params.get(f"drift_{ticker}", "0.0")
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return 0.0
+
+    target_df["Current %"] = target_df["Ticker"].apply(_load_holding)
+
+    # ── Editable table ─────────────────────────────────────────────────────
     drift_edit = st.data_editor(
-        target_df,
+        target_df[["Ticker", "Bucket", "Label", "Target %", "Current %"]],
         column_config={
+            "Ticker":    st.column_config.TextColumn("Ticker",   disabled=True),
+            "Bucket":    st.column_config.TextColumn("Bucket",   disabled=True),
+            "Label":     st.column_config.TextColumn("Name",     disabled=True),
+            "Target %":  st.column_config.NumberColumn("Target %", disabled=True, format="%.1f"),
             "Current %": st.column_config.NumberColumn(
-                "Current % (edit me)", min_value=0.0, max_value=100.0, step=0.1, format="%.1f"
-            )
+                "Current % ✏️", min_value=0.0, max_value=100.0, step=0.1, format="%.1f"
+            ),
         },
         use_container_width=True,
         hide_index=True,
+        key="drift_editor",
     )
 
-    drift_edit["Drift %"] = drift_edit["Current %"] - drift_edit["Target %"]
+    # ── Save / status row ──────────────────────────────────────────────────
+    save_col, status_col = st.columns([1, 3])
+    with save_col:
+        save_drift = st.button("💾  SAVE HOLDINGS", use_container_width=True, key="save_drift_btn")
+    with status_col:
+        has_saved = any(st.query_params.get(f"drift_{t}") for t in drift_tickers)
+        if has_saved:
+            st.markdown("""<div style="font-family:var(--mono);font-size:0.7rem;
+                color:#10b981;padding-top:10px">💾 Showing saved holdings</div>""",
+                unsafe_allow_html=True)
+        else:
+            st.markdown("""<div style="font-family:var(--mono);font-size:0.7rem;
+                color:var(--muted);padding-top:10px">
+                ⚙ No saved holdings — enter values above and save</div>""",
+                unsafe_allow_html=True)
+
+    if save_drift:
+        for _, row in drift_edit.iterrows():
+            st.query_params[f"drift_{row['Ticker']}"] = str(row["Current %"])
+        js_lines = "\n".join(
+            f'localStorage.setItem("aw_drift_{row["Ticker"]}", "{row["Current %"]}");'
+            for _, row in drift_edit.iterrows()
+        )
+        st.components.v1.html(f"<script>{js_lines}</script>", height=0)
+        st.success("✓ Holdings saved — will reload automatically on your next visit.", icon="💾")
+
+    # ── Drift calculations ─────────────────────────────────────────────────
+    drift_edit["Drift %"] = (drift_edit["Current %"] - drift_edit["Target %"]).round(2)
     drift_edit["Action"]  = drift_edit["Drift %"].apply(
         lambda d: "▲ BUY" if d < -1 else ("▼ SELL" if d > 1 else "✓ OK")
     )
 
+    st.markdown("<div style='margin-top:24px'>", unsafe_allow_html=True)
     for _, row in drift_edit.iterrows():
-        drift = row["Drift %"]
-        action= row["Action"]
-        col   = "#10b981" if action == "✓ OK" else ("#3b82f6" if "BUY" in action else "#ef4444")
-        target_bar = min(row["Target %"], 30)
-        current_bar= min(row["Current %"], 30)
+        drift  = row["Drift %"]
+        action = row["Action"]
+        col    = "#10b981" if action == "✓ OK" else ("#3b82f6" if "BUY" in action else "#ef4444")
+        scale       = 40.0
+        target_bar  = min(row["Target %"],  scale) / scale * 100
+        current_bar = min(row["Current %"], scale) / scale * 100
+        bucket_color = {"Core": "#3b82f6", "Tactical": "#10b981", "Hedge": "#f59e0b"}.get(row["Bucket"], "#64748b")
         st.markdown(f"""
-        <div style="padding:12px 0;border-bottom:1px solid var(--border)">
-          <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
-            <b style="font-family:var(--mono);width:48px">{row['Ticker']}</b>
-            <span style="font-size:0.7rem;color:var(--muted);font-family:var(--mono)">{row['Bucket']}</span>
-            <span style="margin-left:auto;font-family:var(--mono);font-size:0.8rem;color:{col}">{action}</span>
-            <span style="font-family:var(--mono);font-size:0.8rem;color:{col}">{drift:+.1f}%</span>
+        <div style="padding:14px 0;border-bottom:1px solid var(--border)">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+            <b style="font-family:var(--mono);width:50px">{row['Ticker']}</b>
+            <span style="font-size:0.68rem;color:{bucket_color};font-family:var(--mono);
+                         background:rgba(255,255,255,0.05);padding:2px 7px;border-radius:3px;
+                         border:1px solid {bucket_color}33">{row['Bucket']}</span>
+            <span style="font-size:0.75rem;color:var(--muted);flex:1">{row['Label']}</span>
+            <span style="font-family:var(--mono);font-size:0.8rem;font-weight:700;color:{col}">{action}</span>
+            <span style="font-family:var(--mono);font-size:0.8rem;color:{col};
+                         width:52px;text-align:right">{drift:+.1f}%</span>
           </div>
-          <div style="display:flex;gap:8px;align-items:center;font-size:0.7rem;color:var(--muted)">
-            <span>Target</span>
-            <div style="flex:1;height:4px;background:var(--surface2);border-radius:2px">
-              <div style="height:100%;width:{target_bar/30*100:.0f}%;background:#3b82f6;border-radius:2px"></div>
+          <div style="display:flex;gap:10px;align-items:center;
+                      font-size:0.68rem;color:var(--muted);margin-bottom:4px">
+            <span style="width:52px;text-align:right">Target</span>
+            <div style="flex:1;height:5px;background:var(--surface2);border-radius:3px">
+              <div style="height:100%;width:{target_bar:.0f}%;background:#3b82f6;border-radius:3px"></div>
             </div>
-            <span>{row['Target %']:.1f}%</span>
+            <span style="width:38px;text-align:right">{row['Target %']:.1f}%</span>
           </div>
-          <div style="display:flex;gap:8px;align-items:center;font-size:0.7rem;color:var(--muted);margin-top:4px">
-            <span>Current</span>
-            <div style="flex:1;height:4px;background:var(--surface2);border-radius:2px">
-              <div style="height:100%;width:{current_bar/30*100:.0f}%;background:{col};border-radius:2px"></div>
+          <div style="display:flex;gap:10px;align-items:center;font-size:0.68rem;color:var(--muted)">
+            <span style="width:52px;text-align:right">Current</span>
+            <div style="flex:1;height:5px;background:var(--surface2);border-radius:3px">
+              <div style="height:100%;width:{current_bar:.0f}%;background:{col};border-radius:3px"></div>
             </div>
-            <span>{row['Current %']:.1f}%</span>
+            <span style="width:38px;text-align:right">{row['Current %']:.1f}%</span>
           </div>
         </div>
         """, unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
+    # ── Summary footer ─────────────────────────────────────────────────────
     total_drift = drift_edit["Drift %"].abs().sum()
+    buys  = drift_edit[drift_edit["Action"] == "▲ BUY"]["Ticker"].tolist()
+    sells = drift_edit[drift_edit["Action"] == "▼ SELL"]["Ticker"].tolist()
+    drift_color = "#10b981" if total_drift < 5 else "#f59e0b" if total_drift < 15 else "#ef4444"
+    drift_msg   = "✓ Within tolerance" if total_drift < 5 else "⚠ Rebalance recommended" if total_drift < 15 else "🚨 Immediate rebalance required"
+    buys_html  = " ".join(f'<span style="background:rgba(59,130,246,0.15);color:#3b82f6;font-family:var(--mono);font-size:0.65rem;padding:2px 7px;border-radius:3px">{t}</span>' for t in buys)  or "—"
+    sells_html = " ".join(f'<span style="background:rgba(239,68,68,0.12);color:#ef4444;font-family:var(--mono);font-size:0.65rem;padding:2px 7px;border-radius:3px">{t}</span>' for t in sells) or "—"
     st.markdown(f"""
-    <div style="margin-top:16px;padding:12px 16px;background:var(--surface2);
-                border:1px solid var(--border);border-radius:6px;
-                font-family:var(--mono);font-size:0.8rem">
-      Total portfolio drift: <b style="color:{'#10b981' if total_drift < 5 else '#f59e0b' if total_drift < 15 else '#ef4444'}">{total_drift:.1f}%</b>
-      &nbsp;—&nbsp;
-      {'✓ Within tolerance' if total_drift < 5 else '⚠ Rebalance recommended' if total_drift < 15 else '🚨 Immediate rebalance required'}
+    <div style="margin-top:20px;padding:16px 20px;background:var(--surface2);
+                border:1px solid var(--border);border-radius:8px;">
+      <div style="display:flex;gap:24px;flex-wrap:wrap;align-items:center">
+        <div>
+          <div style="font-family:var(--mono);font-size:0.6rem;color:var(--muted);
+                      letter-spacing:1px;margin-bottom:4px">TOTAL DRIFT</div>
+          <div style="font-family:var(--mono);font-size:1.3rem;font-weight:700;
+                      color:{drift_color}">{total_drift:.1f}%</div>
+          <div style="font-size:0.75rem;color:{drift_color};margin-top:2px">{drift_msg}</div>
+        </div>
+        <div style="flex:1;min-width:160px">
+          <div style="font-family:var(--mono);font-size:0.6rem;color:var(--muted);
+                      letter-spacing:1px;margin-bottom:6px">▲ BUY</div>
+          <div style="display:flex;gap:4px;flex-wrap:wrap">{buys_html}</div>
+        </div>
+        <div style="flex:1;min-width:160px">
+          <div style="font-family:var(--mono);font-size:0.6rem;color:var(--muted);
+                      letter-spacing:1px;margin-bottom:6px">▼ SELL</div>
+          <div style="display:flex;gap:4px;flex-wrap:wrap">{sells_html}</div>
+        </div>
+      </div>
     </div>
     """, unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-# ─── TAB 4 — GLIDE PATH ──────────────────────────────────────────────────────
-with tab4:
+
     st.markdown('<div class="aw-card">', unsafe_allow_html=True)
     st.markdown('<div class="aw-card-title">🗺 Glide Path — Asset Composition by Life Stage</div>', unsafe_allow_html=True)
     st.markdown("""
@@ -1142,6 +1362,211 @@ with tab4:
     </div>
     """, unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ─── TAB 5 — NARRATIVE RADAR ─────────────────────────────────────────────────
+with tab5:
+    st.markdown('<div class="aw-card">', unsafe_allow_html=True)
+    st.markdown('<div class="aw-card-title">📰 Narrative Radar — GDELT Sentiment × Sector Tilt</div>', unsafe_allow_html=True)
+    st.markdown(f"""
+    <div style="font-size:0.8rem;color:var(--muted);margin-bottom:20px">
+      News sentiment from the <b>GDELT Global Knowledge Graph</b> (7-day window, English sources)
+      scored against your current tactical tilts: <b style="color:#10b981">{', '.join(top3)}</b>.
+      Sentiment tone adjusts conviction — strong narrative tailwinds reinforce holds;
+      headwinds flag positions for closer monitoring.
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Fetch GDELT for all 11 sectors so we can show the full radar, not just top3
+    all_sector_tickers = list(SECTOR_ETFS.keys())
+
+    with st.spinner("Fetching GDELT sentiment data (7-day window)…"):
+        gdelt_data = fetch_gdelt_sentiment(tuple(all_sector_tickers))
+
+    # ── Conviction score: blend momentum rank + sentiment norm ────────────
+    # momentum_rank: 1 (best) to 11 (worst), inverted to 0–1
+    momentum_rank = {t: i for i, t in enumerate(sector_returns.index)}
+    n_sectors     = len(momentum_rank)
+
+    conviction = {}
+    for ticker in all_sector_tickers:
+        mom_score  = 1.0 - (momentum_rank.get(ticker, n_sectors) / n_sectors)  # 0–1
+        sent_norm  = gdelt_data[ticker]["norm"]                                  # -1 to +1
+        sent_score = (sent_norm + 1) / 2                                         # rescale to 0–1
+        # 60% momentum, 40% sentiment — momentum remains primary signal
+        combined   = round(0.60 * mom_score + 0.40 * sent_score, 3)
+        conviction[ticker] = {
+            "momentum_score": round(mom_score,  3),
+            "sentiment_score": round(sent_score, 3),
+            "combined":        combined,
+            "recommendation":  "STRONG HOLD" if combined > 0.70
+                               else "HOLD"    if combined > 0.55
+                               else "MONITOR" if combined > 0.40
+                               else "REDUCE",
+        }
+
+    # ── Top-level summary: conviction for current tactical positions ───────
+    st.markdown("""
+    <div style="font-family:var(--mono);font-size:0.65rem;letter-spacing:2px;
+                text-transform:uppercase;color:var(--muted);margin-bottom:12px">
+      Current Tactical Position Conviction
+    </div>
+    """, unsafe_allow_html=True)
+
+    for ticker in top3:
+        g    = gdelt_data[ticker]
+        c    = conviction[ticker]
+        rec  = c["recommendation"]
+        rec_color = {
+            "STRONG HOLD": "#10b981",
+            "HOLD":        "#3b82f6",
+            "MONITOR":     "#f59e0b",
+            "REDUCE":      "#ef4444",
+        }.get(rec, "#64748b")
+
+        tone_color = "#10b981" if g["norm"] > 0.1 else ("#ef4444" if g["norm"] < -0.1 else "#64748b")
+        bar_w      = int(c["combined"] * 100)
+        mom_bar    = int(c["momentum_score"] * 100)
+        sent_bar   = int(c["sentiment_score"] * 100)
+        aligned    = "✓ regime" if ticker in quad_preferred else "↑ momentum"
+        aligned_c  = "var(--accent)" if ticker in quad_preferred else "var(--accent3)"
+
+        st.markdown(f"""
+        <div style="padding:18px 20px;background:var(--surface2);border:1px solid var(--border);
+                    border-left:3px solid {rec_color};border-radius:8px;margin-bottom:12px">
+          <div style="display:flex;align-items:flex-start;justify-content:space-between;
+                      margin-bottom:14px;gap:12px;flex-wrap:wrap">
+            <div>
+              <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
+                <b style="font-family:var(--mono);font-size:1.05rem">{ticker}</b>
+                <span style="font-size:0.75rem;color:var(--muted)">{SECTOR_ETFS.get(ticker,'')}</span>
+                <span style="font-size:0.65rem;color:{aligned_c};font-family:var(--mono)">{aligned}</span>
+              </div>
+              <div style="font-size:0.75rem;color:var(--muted)">
+                GDELT articles (7d): <b style="color:var(--text)">{g['count']}</b>
+                &nbsp;·&nbsp; Avg tone: <b style="color:{tone_color}">{g['score']:+.2f}</b>
+                &nbsp;·&nbsp; Signal: <b style="color:{tone_color}">{g['tone_label']}</b>
+              </div>
+            </div>
+            <div style="text-align:right">
+              <div style="font-family:var(--mono);font-size:0.6rem;color:var(--muted);
+                          letter-spacing:1px;margin-bottom:4px">CONVICTION</div>
+              <div style="font-family:var(--mono);font-size:1.4rem;font-weight:700;
+                          color:{rec_color}">{int(c['combined']*100)}</div>
+              <div style="font-family:var(--mono);font-size:0.65rem;color:{rec_color};
+                          letter-spacing:1px">{rec}</div>
+            </div>
+          </div>
+
+          <div style="margin-bottom:8px">
+            <div style="display:flex;justify-content:space-between;font-size:0.65rem;
+                        color:var(--muted);font-family:var(--mono);margin-bottom:3px">
+              <span>Combined conviction</span><span>{c['combined']*100:.0f}/100</span>
+            </div>
+            <div style="height:6px;background:rgba(255,255,255,0.05);border-radius:3px">
+              <div style="height:100%;width:{bar_w}%;background:{rec_color};border-radius:3px"></div>
+            </div>
+          </div>
+          <div style="display:flex;gap:16px">
+            <div style="flex:1">
+              <div style="display:flex;justify-content:space-between;font-size:0.62rem;
+                          color:var(--muted);font-family:var(--mono);margin-bottom:3px">
+                <span>Momentum (60%)</span><span>{mom_bar}</span>
+              </div>
+              <div style="height:4px;background:rgba(255,255,255,0.05);border-radius:2px">
+                <div style="height:100%;width:{mom_bar}%;background:#3b82f6;border-radius:2px"></div>
+              </div>
+            </div>
+            <div style="flex:1">
+              <div style="display:flex;justify-content:space-between;font-size:0.62rem;
+                          color:var(--muted);font-family:var(--mono);margin-bottom:3px">
+                <span>Sentiment (40%)</span><span>{sent_bar}</span>
+              </div>
+              <div style="height:4px;background:rgba(255,255,255,0.05);border-radius:2px">
+                <div style="height:100%;width:{sent_bar}%;background:{tone_color};border-radius:2px"></div>
+              </div>
+            </div>
+          </div>
+
+          {f"""<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+            <div style="font-family:var(--mono);font-size:0.6rem;color:var(--muted);
+                        letter-spacing:1px;margin-bottom:8px">RECENT HEADLINES</div>
+            {"".join(f'<div style="font-size:0.75rem;color:var(--muted);padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.04);line-height:1.4"><span style=color:rgba(255,255,255,0.15)>›</span> {h["title"][:110]}{"…" if len(h["title"])>110 else ""}</div>' for h in g["headlines"][:3])}
+          </div>""" if g['headlines'] else ""}
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── Full sector radar ──────────────────────────────────────────────────
+    st.markdown("""
+    <div style="font-family:var(--mono);font-size:0.65rem;letter-spacing:2px;
+                text-transform:uppercase;color:var(--muted);margin:24px 0 12px">
+      Full Sector Narrative Scan
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Sort by combined conviction descending
+    sorted_sectors = sorted(all_sector_tickers,
+                            key=lambda t: conviction[t]["combined"], reverse=True)
+
+    for ticker in sorted_sectors:
+        g    = gdelt_data[ticker]
+        c    = conviction[ticker]
+        rec  = c["recommendation"]
+        is_selected = ticker in top3
+        rec_color = {
+            "STRONG HOLD": "#10b981", "HOLD": "#3b82f6",
+            "MONITOR": "#f59e0b",     "REDUCE": "#ef4444",
+        }.get(rec, "#64748b")
+        tone_color = "#10b981" if g["norm"] > 0.1 else ("#ef4444" if g["norm"] < -0.1 else "#64748b")
+        bar_w = int(c["combined"] * 100)
+        ret   = sector_returns.get(ticker, 0.0)
+        ret_c = "#10b981" if ret >= 0 else "#ef4444"
+        sel_badge = f'<span style="background:#10b981;color:#0a0c10;font-family:var(--mono);font-size:0.58rem;padding:2px 7px;border-radius:3px;font-weight:700;margin-left:6px">TACTICAL</span>' if is_selected else ""
+
+        st.markdown(f"""
+        <div style="display:flex;align-items:center;gap:12px;padding:10px 0;
+                    border-bottom:1px solid var(--border)">
+          <div style="width:46px;font-family:var(--mono);font-size:0.82rem;
+                      font-weight:700;color:{'var(--text)' if is_selected else 'var(--muted)'}">{ticker}</div>
+          <div style="width:110px;font-size:0.72rem;color:var(--muted)">
+            {SECTOR_ETFS.get(ticker,'')} {sel_badge}
+          </div>
+          <div style="flex:1;height:5px;background:var(--surface2);border-radius:3px">
+            <div style="height:100%;width:{bar_w}%;background:{rec_color};border-radius:3px;
+                        opacity:{'1' if is_selected else '0.5'}"></div>
+          </div>
+          <div style="width:34px;text-align:right;font-family:var(--mono);font-size:0.75rem;
+                      color:{rec_color}">{bar_w}</div>
+          <div style="width:60px;text-align:right;font-family:var(--mono);font-size:0.72rem;
+                      color:{ret_c}">{ret*100:+.1f}%</div>
+          <div style="width:68px;text-align:right;font-family:var(--mono);font-size:0.65rem;
+                      color:{tone_color}">{g['tone_label']}</div>
+          <div style="width:80px;text-align:right;font-family:var(--mono);font-size:0.65rem;
+                      color:{rec_color};letter-spacing:0.5px">{rec}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── Methodology note ───────────────────────────────────────────────────
+    st.markdown(f"""
+    <div style="margin-top:24px;padding:16px 20px;background:rgba(59,130,246,0.06);
+                border:1px solid rgba(59,130,246,0.15);border-radius:8px;
+                font-size:0.77rem;color:var(--muted);line-height:1.6">
+      <b style="color:#3b82f6;font-family:var(--mono)">METHODOLOGY</b><br><br>
+      <b style="color:var(--text)">Conviction score</b> = 60% momentum rank + 40% GDELT sentiment.
+      Momentum remains the primary signal; sentiment acts as a confirming or cautioning overlay.
+      A high-momentum sector with negative narrative (e.g. energy during a regulatory crackdown)
+      will show reduced conviction relative to pure price action.<br><br>
+      <b style="color:var(--text)">GDELT tone</b> is the average
+      <i>DocumentTone</i> across English-language articles matching sector keywords over a
+      7-day rolling window. Scores &gt; +0.10 normalized = Bullish;
+      &lt; -0.10 = Bearish; otherwise Neutral. Data refreshes every 30 minutes.
+      <br><br>
+      <b style="color:var(--text)">Recommendation thresholds:</b>
+      STRONG HOLD ≥ 70 · HOLD 55–70 · MONITOR 40–55 · REDUCE &lt; 40
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
 
 
 st.markdown(f"""
