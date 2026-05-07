@@ -8,7 +8,7 @@ warnings.filterwarnings('ignore')
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="ShillNye's All-Weather Dashboard",
+    page_title="Project All-Weather",
     page_icon="🌦",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -423,7 +423,8 @@ def fetch_fred_macro():
         gdp_trend = "rising" if gdp.iloc[-1] > gdp.iloc[-2] else "falling"
         gdp_vals  = gdp.tolist()
     if cpi is not None and len(cpi) >= 2:
-        cpi_trend = "rising" if cpi.iloc[-1] > cpi.iloc[-5] else "falling"
+        lookback = min(5, len(cpi) - 1)
+        cpi_trend = "rising" if cpi.iloc[-1] > cpi.iloc[-lookback] else "falling"
         cpi_vals  = cpi.tolist()
 
     return gdp_trend, cpi_trend, gdp_vals, cpi_vals
@@ -444,89 +445,138 @@ SECTOR_KEYWORDS = {
 }
 
 @st.cache_data(ttl=1800)
-def fetch_gdelt_sentiment(tickers: list) -> dict:
+def fetch_gdelt_sentiment(tickers: tuple) -> dict:
     """
-    Query GDELT GKG (Global Knowledge Graph) API for recent news tone
-    around each sector. Returns dict of {ticker: {score, tone, count, headlines}}.
+    Pull news sentiment for each sector using two approaches in order:
 
-    GDELT Article Search API — free, no key required.
-    Tone: negative = bearish coverage, positive = bullish coverage.
-    Range roughly -100 (extremely negative) to +100 (extremely positive).
-    Real-world sector scores typically fall between -8 and +4.
+    1. GDELT GKG Timeline API  (/api/v2/tv/tv  mode=timelinetone)
+       — Returns pre-aggregated avg tone over a time window; not IP-blocked.
+    2. RSS headline scrape via Google News (fallback)
+       — Counts positive/negative financial keywords in titles.
+
+    Returns: {ticker: {score, norm, count, tone_label, headlines, error, source}}
+    Tone: negative = bearish, positive = bullish. Typical range ±8.
+    norm: rescaled to -1…+1 for bar display.
     """
-    import urllib.request, json, urllib.parse
+    import urllib.request, urllib.parse, json, re
     from datetime import datetime, timedelta
 
-    results = {}
-    base_url = "https://api.gdeltproject.org/api/v2/doc/doc"
+    # ── Positive / negative keyword lexicon for RSS fallback ──────────────
+    POS_WORDS = {"surges","rises","gains","record","beat","strong","growth",
+                 "rally","upgrade","outperform","boom","breakthrough","positive",
+                 "profit","expands","climbs","bullish","advances","soars"}
+    NEG_WORDS = {"falls","drops","decline","miss","weak","loss","cut","downgrade",
+                 "risk","concern","slowdown","crisis","bearish","plunges","crash",
+                 "warning","threat","lower","contraction","disappoints","deficit"}
 
-    # Look back 7 days for recency
-    end_dt   = datetime.utcnow()
-    start_dt = end_dt - timedelta(days=7)
-    timespan = "1week"
+    def _gdelt_timeline(query: str) -> float | None:
+        """
+        Hit the GDELT GKG 2.0 timeline tone endpoint.
+        Returns avg tone float or None on failure.
+        """
+        params = urllib.parse.urlencode({
+            "query":    query,
+            "mode":     "timelineTone",
+            "format":   "json",
+            "timespan": "7d",
+            "sourcelang": "english",
+        })
+        url = f"https://api.gdeltproject.org/api/v2/doc/doc?{params}"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json",
+            "Referer": "https://gdeltproject.org/",
+        })
+        with urllib.request.urlopen(req, timeout=12) as r:
+            data = json.loads(r.read().decode("utf-8", errors="ignore"))
+
+        # Response shape: {"timeline":[{"data":[{"value": float}, ...]}]}
+        timeline = data.get("timeline", [])
+        if not timeline:
+            return None
+        tone_series = timeline[0].get("data", [])
+        values = [pt["value"] for pt in tone_series if pt.get("value") is not None]
+        if not values:
+            return None
+        return sum(values) / len(values)
+
+    def _rss_fallback(keywords: list) -> tuple[float, list]:
+        """
+        Fetch Google News RSS for the top keyword, score headlines via lexicon.
+        Returns (avg_tone_estimate, headlines_list).
+        Tone is estimated: +1 per positive word, -1 per negative word, averaged.
+        Scaled to GDELT-like range by multiplying by 3.
+        """
+        kw = urllib.parse.quote(keywords[0])
+        url = f"https://news.google.com/rss/search?q={kw}+stock+market&hl=en-US&gl=US&ceid=US:en"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; RSS reader)"
+        })
+        with urllib.request.urlopen(req, timeout=10) as r:
+            xml = r.read().decode("utf-8", errors="ignore")
+
+        # Extract titles with simple regex — no lxml needed
+        titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", xml)
+        if not titles:
+            titles = re.findall(r"<title>(.*?)</title>", xml)
+        titles = [t for t in titles if len(t) > 15][:15]  # skip feed-level title
+
+        scores = []
+        for title in titles:
+            words  = set(title.lower().split())
+            score  = sum(1 for w in words if w in POS_WORDS) \
+                   - sum(1 for w in words if w in NEG_WORDS)
+            scores.append(score)
+
+        avg = (sum(scores) / len(scores) * 3.0) if scores else 0.0
+        headlines = [{"title": t, "url": ""} for t in titles[:5]]
+        return avg, headlines
+
+    results = {}
 
     for ticker in tickers:
         keywords = SECTOR_KEYWORDS.get(ticker, [ticker])
-        # Use top 2 keywords joined as OR query — keeps results broad but relevant
-        query_str = " OR ".join(f'"{k}"' for k in keywords[:2])
+        # Primary query: top two keywords joined with OR
+        query = " OR ".join(f'"{k}"' for k in keywords[:2])
+        score     = None
+        headlines = []
+        source    = "gdelt"
+        error     = None
 
-        params = urllib.parse.urlencode({
-            "query":    query_str,
-            "mode":     "artlist",
-            "maxrecords": 25,
-            "format":   "json",
-            "timespan": timespan,
-            "sourcelang": "english",
-        })
-        url = f"{base_url}?{params}"
-
+        # ── Attempt 1: GDELT timeline tone ────────────────────────────────
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=10) as r:
-                raw = json.loads(r.read().decode("utf-8", errors="ignore"))
+            score = _gdelt_timeline(query)
+            if score is None:
+                raise ValueError("empty timeline")
+            source = "gdelt"
+        except Exception as e1:
+            error = f"GDELT: {e1}"
+            # ── Attempt 2: RSS keyword fallback ───────────────────────────
+            try:
+                score, headlines = _rss_fallback(keywords)
+                source = "rss"
+                error  = None
+            except Exception as e2:
+                score  = 0.0
+                source = "unavailable"
+                error  = f"GDELT: {e1} | RSS: {e2}"
 
-            articles = raw.get("articles", [])
-            if not articles:
-                raise ValueError("no articles")
+        score = score or 0.0
+        norm  = round(max(-1.0, min(1.0, score / 8.0)), 3)
 
-            tones    = [float(a.get("socialimage", "0") or 0) for a in articles]
-            # GDELT tone is in the 'tone' field of ArtList; fallback gracefully
-            tones    = []
-            headlines = []
-            for a in articles:
-                t_val = a.get("tone", None)
-                if t_val is not None:
-                    try:
-                        tones.append(float(t_val))
-                    except (ValueError, TypeError):
-                        pass
-                title = a.get("title", "")
-                url_a = a.get("url", "")
-                if title:
-                    headlines.append({"title": title, "url": url_a})
-
-            if not tones:
-                raise ValueError("no tone data")
-
-            avg_tone = sum(tones) / len(tones)
-            # Normalise to -1 … +1 for display (typical range is ±10)
-            norm     = max(-1.0, min(1.0, avg_tone / 10.0))
-
-            results[ticker] = {
-                "score":     round(avg_tone, 2),
-                "norm":      round(norm, 3),
-                "count":     len(articles),
-                "tone_label": "Bullish" if norm > 0.1 else ("Bearish" if norm < -0.1 else "Neutral"),
-                "headlines": headlines[:5],
-                "error":     None,
-            }
-
-        except Exception as exc:
-            results[ticker] = {
-                "score": 0.0, "norm": 0.0, "count": 0,
-                "tone_label": "N/A", "headlines": [],
-                "error": str(exc),
-            }
+        results[ticker] = {
+            "score":      round(float(score), 2),
+            "norm":       norm,
+            "count":      len(headlines) if headlines else (1 if source == "gdelt" else 0),
+            "tone_label": "Bullish" if norm > 0.1 else ("Bearish" if norm < -0.1 else "Neutral"),
+            "headlines":  headlines[:5],
+            "source":     source,
+            "error":      error,
+        }
 
     return results
 
@@ -639,7 +689,7 @@ st.markdown(f"""
 <div class="aw-header">
   <span style="font-size:2rem">🌦</span>
   <div>
-    <h1>ShillNye's All-Weather Dashboard</h1>
+    <h1>PROJECT ALL-WEATHER</h1>
     <div style="margin-top:4px;display:flex;gap:8px">
       <span class="aw-badge">EQUITY CORE</span>
       <span class="aw-badge" style="background:#10b981">PURE ALPHA</span>
@@ -746,16 +796,17 @@ hedge_bucket = hedge_pct / 100
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=3600)
-def get_atrs(tickers):
+def get_atrs(tickers, _prices: pd.DataFrame):
+    """_prices prefixed with _ so st.cache_data skips hashing the DataFrame."""
     result = {}
     for t in tickers:
-        px = prices_all[t].iloc[-1] if t in prices_all.columns else 0
-        atr_val = compute_atr(prices_all, t)
+        px      = _prices[t].iloc[-1] if t in _prices.columns else 0
+        atr_val = compute_atr(_prices, t)
         stop    = float(px) - 2 * float(atr_val)
         result[t] = {"price": float(px), "atr": float(atr_val), "stop": stop}
     return result
 
-atr_data = get_atrs(tuple(top3))
+atr_data = get_atrs(tuple(top3), prices_all)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # REQUIRED SHARES CALCULATION
@@ -976,7 +1027,7 @@ with tab1:
         for ticker in top3:
             dollar = total_inv * tactical_per_sector
             shares, px = calc_shares(ticker, dollar)
-            ret    = sector_returns.get(ticker, 0.0)
+            ret    = sector_returns[ticker] if ticker in sector_returns.index else 0.0
             atr_info = atr_data.get(ticker, {"atr": 0, "stop": 0, "price": px})
             aligned  = "✓ regime" if ticker in quad_preferred else "↑ momentum"
             ret_color = "#10b981" if ret >= 0 else "#ef4444"
@@ -1294,7 +1345,6 @@ with tab3:
     """, unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-
 # ─── TAB 4 — GLIDE PATH ──────────────────────────────────────────────────────
 with tab4:
     st.markdown('<div class="aw-card">', unsafe_allow_html=True)
@@ -1306,32 +1356,45 @@ with tab4:
     </div>
     """, unsafe_allow_html=True)
 
-    # Build glide path timeline
-    stage_colors = ["#10b981","#3b82f6","#f59e0b","#f97316","#ef4444"]
+    # Bug fix: pre-define rgba values per stage — hex-to-rgb conversion was failing silently
+    stage_colors = ["#10b981", "#3b82f6", "#f59e0b", "#f97316", "#ef4444"]
+    stage_bgs    = [
+        "rgba(16,185,129,0.10)",
+        "rgba(59,130,246,0.10)",
+        "rgba(245,158,11,0.10)",
+        "rgba(249,115,22,0.10)",
+        "rgba(239,68,68,0.10)",
+    ]
+
     for i, (stage, cfg) in enumerate(GLIDE_PRESETS.items()):
         is_current = stage == glide_choice
         border_col = stage_colors[i]
-        bg = f"rgba({','.join(str(int(border_col.lstrip('#')[j:j+2],16)) for j in (0,2,4))},0.10)" if is_current else "var(--surface2)"
-        assets = cfg["assets"]
+        bg         = stage_bgs[i] if is_current else "var(--surface2)"
+        border     = border_col   if is_current else "var(--border)"
+        assets     = cfg["assets"]
 
-        # Classify assets for the mini bar
-        equity_a = [a for a in assets if a in ["VOO","VEA","VWO"]]
-        bond_a   = [a for a in assets if a in ["TLT","IEF"]]
-        alt_a    = [a for a in assets if a in ["GLD","GSG"]]
-        n = len(assets)
-        eq_w  = len(equity_a)/n*100
-        bond_w= len(bond_a)/n*100
-        alt_w = len(alt_a)/n*100
+        equity_a = [a for a in assets if a in ["VOO", "VEA", "VWO"]]
+        bond_a   = [a for a in assets if a in ["TLT", "IEF"]]
+        alt_a    = [a for a in assets if a in ["GLD", "GSG"]]
+        n        = len(assets)
+        eq_w     = len(equity_a) / n * 100
+        bond_w   = len(bond_a)   / n * 100
+        alt_w    = len(alt_a)    / n * 100
 
-        current_badge = f'<span style="background:{border_col};color:white;font-family:var(--mono);font-size:0.6rem;padding:2px 8px;border-radius:3px;letter-spacing:1px;margin-left:10px">CURRENT</span>' if is_current else "not current"
+        current_badge = (
+            f'<span style="background:{border_col};color:white;font-family:var(--mono);'
+            f'font-size:0.6rem;padding:2px 8px;border-radius:3px;'
+            f'letter-spacing:1px;margin-left:10px">CURRENT</span>'
+        ) if is_current else ""
 
+        label_color = "var(--text)" if is_current else "var(--muted)"
 
         st.markdown(f"""
-        <div style="padding:18px 20px;background:{bg};border:1px solid {''+border_col if is_current else 'var(--border)'};
+        <div style="padding:18px 20px;background:{bg};border:1px solid {border};
                     border-radius:8px;margin-bottom:12px">
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
             <div>
-              <b style="font-family:var(--mono);font-size:0.85rem;color:{'var(--text)' if is_current else 'var(--muted)'}">{stage}</b>
+              <b style="font-family:var(--mono);font-size:0.85rem;color:{label_color}">{stage}</b>
               {current_badge}
             </div>
             <div style="font-size:0.75rem;color:var(--muted)">
@@ -1339,9 +1402,9 @@ with tab4:
             </div>
           </div>
           <div style="height:10px;border-radius:5px;overflow:hidden;display:flex;margin-bottom:10px">
-            <div style="width:{eq_w}%;background:#10b981;transition:width 0.4s"></div>
-            <div style="width:{bond_w}%;background:#3b82f6"></div>
-            <div style="width:{alt_w}%;background:#f59e0b"></div>
+            <div style="width:{eq_w:.1f}%;background:#10b981"></div>
+            <div style="width:{bond_w:.1f}%;background:#3b82f6"></div>
+            <div style="width:{alt_w:.1f}%;background:#f59e0b"></div>
           </div>
           <div style="display:flex;gap:16px;font-size:0.7rem;color:var(--muted);font-family:var(--mono)">
             <span><span style="color:#10b981">■</span> Equity {eq_w:.0f}%</span>
@@ -1357,17 +1420,16 @@ with tab4:
                 border:1px solid rgba(139,92,246,0.25);border-radius:8px;
                 font-size:0.8rem;color:var(--muted)">
       <b style="color:#8b5cf6;font-family:var(--mono)">HOW TO USE THIS</b><br><br>
-      The glide path is a manual decision — there's no automatic trigger. Revisit your life stage
+      The glide path is a manual decision — there is no automatic trigger. Revisit your life stage
       selection every 5–10 years, or after major life events (marriage, dependents, income change).
       The tactical and hedge buckets <b style="color:var(--text)">stay at 30% / 10%</b> regardless of
       life stage — only the core composition changes. When you shift stages, rebalance the core
-      bucket gradually over 2–3 quarters to avoid tax events from selling large positions at once.
+      bucket gradually over 2–3 quarters to avoid large tax events from selling positions at once.
     </div>
     """, unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 
-# ─── TAB 5 — NARRATIVE RADAR ─────────────────────────────────────────────────
 with tab5:
     st.markdown('<div class="aw-card">', unsafe_allow_html=True)
     st.markdown('<div class="aw-card-title">📰 Narrative Radar — GDELT Sentiment × Sector Tilt</div>', unsafe_allow_html=True)
@@ -1407,6 +1469,35 @@ with tab5:
                                else "MONITOR" if combined > 0.40
                                else "REDUCE",
         }
+
+    # ── Data source summary ────────────────────────────────────────────────
+    source_counts = {}
+    for v in gdelt_data.values():
+        s = v.get("source", "unavailable")
+        source_counts[s] = source_counts.get(s, 0) + 1
+
+    source_badges = []
+    badge_map = {
+        "gdelt":       ("GDELT LIVE",   "#10b981"),
+        "rss":         ("RSS FALLBACK", "#f59e0b"),
+        "unavailable": ("NO DATA",      "#ef4444"),
+    }
+    for src, count in source_counts.items():
+        label, color = badge_map.get(src, (src.upper(), "#64748b"))
+        source_badges.append(
+            f'<span style="background:rgba(255,255,255,0.05);border:1px solid {color}33;'
+            f'color:{color};font-family:var(--mono);font-size:0.62rem;'
+            f'padding:3px 8px;border-radius:3px">'
+            f'{label} ({count})</span>'
+        )
+
+    st.markdown(f"""
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:20px;flex-wrap:wrap">
+      <span style="font-size:0.72rem;color:var(--muted)">Data sources:</span>
+      {"".join(source_badges)}
+      <span style="font-size:0.68rem;color:var(--muted);margin-left:4px">· refreshes every 30 min</span>
+    </div>
+    """, unsafe_allow_html=True)
 
     # ── Top-level summary: conviction for current tactical positions ───────
     st.markdown("""
@@ -1449,6 +1540,11 @@ with tab5:
                 GDELT articles (7d): <b style="color:var(--text)">{g['count']}</b>
                 &nbsp;·&nbsp; Avg tone: <b style="color:{tone_color}">{g['score']:+.2f}</b>
                 &nbsp;·&nbsp; Signal: <b style="color:{tone_color}">{g['tone_label']}</b>
+                &nbsp;·&nbsp;
+                <span style="font-family:var(--mono);font-size:0.65rem;
+                  color:{badge_map.get(g.get('source','unavailable'),('','#64748b'))[1]}">
+                  {badge_map.get(g.get('source','unavailable'),('N/A','#64748b'))[0]}
+                </span>
               </div>
             </div>
             <div style="text-align:right">
@@ -1522,7 +1618,7 @@ with tab5:
         }.get(rec, "#64748b")
         tone_color = "#10b981" if g["norm"] > 0.1 else ("#ef4444" if g["norm"] < -0.1 else "#64748b")
         bar_w = int(c["combined"] * 100)
-        ret   = sector_returns.get(ticker, 0.0)
+        ret   = sector_returns[ticker] if ticker in sector_returns.index else 0.0
         ret_c = "#10b981" if ret >= 0 else "#ef4444"
         sel_badge = f'<span style="background:#10b981;color:#0a0c10;font-family:var(--mono);font-size:0.58rem;padding:2px 7px;border-radius:3px;font-weight:700;margin-left:6px">TACTICAL</span>' if is_selected else ""
 
