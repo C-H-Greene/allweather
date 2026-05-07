@@ -1323,7 +1323,7 @@ with tab4:
         bond_w= len(bond_a)/n*100
         alt_w = len(alt_a)/n*100
 
-        current_badge = f'<span style="background:{border_col};color:white;font-family:var(--mono);font-size:0.6rem;padding:2px 8px;border-radius:3px;letter-spacing:1px;margin-left:10px">CURRENT</span>' if is_current
+        current_badge = f'<span style="background:{border_col};color:white;font-family:var(--mono);font-size:0.6rem;padding:2px 8px;border-radius:3px;letter-spacing:1px;margin-left:10px">CURRENT</span>'
 
         st.markdown(f"""
         <div style="padding:18px 20px;background:{bg};border:1px solid {''+border_col if is_current else 'var(--border)'};
