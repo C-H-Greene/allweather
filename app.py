@@ -395,6 +395,58 @@ def fetch_price_data(tickers: list, period: str = "1y") -> pd.DataFrame:
         return _make_demo_prices(tickers)
 
 @st.cache_data(ttl=3600)
+def fetch_volume_data(tickers: list, period: str = "3mo") -> pd.DataFrame:
+    """Fetch daily volume for tickers. Returns DataFrame of volumes."""
+    try:
+        data = yf.download(tickers, period=period, auto_adjust=True, progress=False)
+        if isinstance(data.columns, pd.MultiIndex):
+            vol = data["Volume"]
+        else:
+            vol = data[["Volume"]].rename(columns={"Volume": tickers[0]})
+        if vol.empty or vol.isnull().all().all():
+            raise ValueError("Empty volume")
+        return vol.ffill()
+    except Exception:
+        # Synthetic demo volume
+        np.random.seed(99)
+        dates = pd.bdate_range(end=datetime.today(), periods=65)
+        result = {}
+        for t in tickers:
+            base = 20_000_000
+            result[t] = (np.random.lognormal(0, 0.3, len(dates)) * base).astype(int)
+        return pd.DataFrame(result, index=dates)
+
+@st.cache_data(ttl=3600)
+def fetch_options_pcr(tickers: list) -> dict:
+    """
+    Fetch Put/Call volume ratio for each ticker using yfinance options chains.
+    Uses the nearest 2 expiration dates to get a liquid cross-section.
+    Falls back to None per ticker if options data unavailable.
+    """
+    result = {}
+    for ticker in tickers:
+        try:
+            t    = yf.Ticker(ticker)
+            exps = t.options
+            if not exps:
+                result[ticker] = None
+                continue
+            total_put_vol  = 0
+            total_call_vol = 0
+            # Use nearest 2 expirations for liquidity
+            for exp in exps[:2]:
+                chain          = t.option_chain(exp)
+                total_call_vol += chain.calls["volume"].fillna(0).sum()
+                total_put_vol  += chain.puts["volume"].fillna(0).sum()
+            if total_call_vol > 0:
+                result[ticker] = round(total_put_vol / total_call_vol, 3)
+            else:
+                result[ticker] = None
+        except Exception:
+            result[ticker] = None
+    return result
+
+@st.cache_data(ttl=3600)
 def fetch_fred_macro():
     """Pull GDP and CPI trend from FRED via direct HTTP (no API key required for these series)."""
     import urllib.request, json
@@ -429,156 +481,88 @@ def fetch_fred_macro():
 
     return gdp_trend, cpi_trend, gdp_vals, cpi_vals
 
-# Sector → search keywords for GDELT headline matching
-SECTOR_KEYWORDS = {
-    "XLE":  ["energy", "oil", "gas", "petroleum", "OPEC", "crude"],
-    "XLK":  ["technology", "semiconductor", "AI", "software", "chip", "tech"],
-    "XLV":  ["healthcare", "pharma", "biotech", "drug", "FDA", "hospital"],
-    "XLF":  ["bank", "finance", "interest rate", "Fed", "credit", "lending"],
-    "XLI":  ["industrial", "manufacturing", "defense", "aerospace", "infrastructure"],
-    "XLY":  ["consumer", "retail", "spending", "discretionary", "e-commerce"],
-    "XLP":  ["staples", "grocery", "food", "beverage", "household", "consumer goods"],
-    "XLB":  ["materials", "mining", "steel", "copper", "chemical", "commodity"],
-    "XLC":  ["media", "telecom", "streaming", "advertising", "social", "communication"],
-    "XLU":  ["utility", "electricity", "power grid", "renewable", "water"],
-    "XLRE": ["real estate", "REIT", "housing", "mortgage", "property"],
-}
+# ── Technical sentiment proxy — replaces unreliable external APIs ─────────────
+# GDELT and all RSS sources return 403 from cloud/datacenter IPs (Streamlit Cloud
+# runs on GCP which is blocked by all major news APIs). Instead we derive sentiment
+# from price action already in memory — no network calls, always available.
+#
+# Signals used (each normalized 0→1, then blended):
+#   RSI-14        : >60 bullish, <40 bearish
+#   Price vs SMA20: above = bullish, magnitude scaled
+#   Volume trend  : 5d avg vol vs 20d avg vol (rising volume confirms moves)
 
-@st.cache_data(ttl=1800)
-def fetch_gdelt_sentiment(tickers: tuple) -> dict:
+def compute_technical_sentiment(prices: pd.DataFrame, volumes: pd.DataFrame) -> dict:
     """
-    Pull news sentiment for each sector using two approaches in order:
-
-    1. GDELT GKG Timeline API  (/api/v2/tv/tv  mode=timelinetone)
-       — Returns pre-aggregated avg tone over a time window; not IP-blocked.
-    2. RSS headline scrape via Google News (fallback)
-       — Counts positive/negative financial keywords in titles.
-
-    Returns: {ticker: {score, norm, count, tone_label, headlines, error, source}}
-    Tone: negative = bearish, positive = bullish. Typical range ±8.
-    norm: rescaled to -1…+1 for bar display.
+    Derive a sentiment score for each ticker purely from price + volume data.
+    Returns same schema as the old fetch_gdelt_sentiment for drop-in compatibility.
     """
-    import urllib.request, urllib.parse, json, re
-    from datetime import datetime, timedelta
-
-    # ── Positive / negative keyword lexicon for RSS fallback ──────────────
-    POS_WORDS = {"surges","rises","gains","record","beat","strong","growth",
-                 "rally","upgrade","outperform","boom","breakthrough","positive",
-                 "profit","expands","climbs","bullish","advances","soars"}
-    NEG_WORDS = {"falls","drops","decline","miss","weak","loss","cut","downgrade",
-                 "risk","concern","slowdown","crisis","bearish","plunges","crash",
-                 "warning","threat","lower","contraction","disappoints","deficit"}
-
-    def _gdelt_timeline(query: str) -> float | None:
-        """
-        Hit the GDELT GKG 2.0 timeline tone endpoint.
-        Returns avg tone float or None on failure.
-        """
-        params = urllib.parse.urlencode({
-            "query":    query,
-            "mode":     "timelineTone",
-            "format":   "json",
-            "timespan": "7d",
-            "sourcelang": "english",
-        })
-        url = f"https://api.gdeltproject.org/api/v2/doc/doc?{params}"
-        req = urllib.request.Request(url, headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept": "application/json",
-            "Referer": "https://gdeltproject.org/",
-        })
-        with urllib.request.urlopen(req, timeout=12) as r:
-            data = json.loads(r.read().decode("utf-8", errors="ignore"))
-
-        # Response shape: {"timeline":[{"data":[{"value": float}, ...]}]}
-        timeline = data.get("timeline", [])
-        if not timeline:
-            return None
-        tone_series = timeline[0].get("data", [])
-        values = [pt["value"] for pt in tone_series if pt.get("value") is not None]
-        if not values:
-            return None
-        return sum(values) / len(values)
-
-    def _rss_fallback(keywords: list) -> tuple[float, list]:
-        """
-        Fetch Google News RSS for the top keyword, score headlines via lexicon.
-        Returns (avg_tone_estimate, headlines_list).
-        Tone is estimated: +1 per positive word, -1 per negative word, averaged.
-        Scaled to GDELT-like range by multiplying by 3.
-        """
-        kw = urllib.parse.quote(keywords[0])
-        url = f"https://news.google.com/rss/search?q={kw}+stock+market&hl=en-US&gl=US&ceid=US:en"
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (compatible; RSS reader)"
-        })
-        with urllib.request.urlopen(req, timeout=10) as r:
-            xml = r.read().decode("utf-8", errors="ignore")
-
-        # Extract titles with simple regex — no lxml needed
-        titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", xml)
-        if not titles:
-            titles = re.findall(r"<title>(.*?)</title>", xml)
-        titles = [t for t in titles if len(t) > 15][:15]  # skip feed-level title
-
-        scores = []
-        for title in titles:
-            words  = set(title.lower().split())
-            score  = sum(1 for w in words if w in POS_WORDS) \
-                   - sum(1 for w in words if w in NEG_WORDS)
-            scores.append(score)
-
-        avg = (sum(scores) / len(scores) * 3.0) if scores else 0.0
-        headlines = [{"title": t, "url": ""} for t in titles[:5]]
-        return avg, headlines
-
     results = {}
 
-    for ticker in tickers:
-        keywords = SECTOR_KEYWORDS.get(ticker, [ticker])
-        # Primary query: top two keywords joined with OR
-        query = " OR ".join(f'"{k}"' for k in keywords[:2])
-        score     = None
-        headlines = []
-        source    = "gdelt"
-        error     = None
-
-        # ── Attempt 1: GDELT timeline tone ────────────────────────────────
+    for ticker in prices.columns:
         try:
-            score = _gdelt_timeline(query)
-            if score is None:
-                raise ValueError("empty timeline")
-            source = "gdelt"
-        except Exception as e1:
-            error = f"GDELT: {e1}"
-            # ── Attempt 2: RSS keyword fallback ───────────────────────────
-            try:
-                score, headlines = _rss_fallback(keywords)
-                source = "rss"
-                error  = None
-            except Exception as e2:
-                score  = 0.0
-                source = "unavailable"
-                error  = f"GDELT: {e1} | RSS: {e2}"
+            px  = prices[ticker].dropna()
+            vol = volumes[ticker].dropna() if ticker in volumes.columns else pd.Series(dtype=float)
 
-        score = score or 0.0
-        norm  = round(max(-1.0, min(1.0, score / 8.0)), 3)
+            if len(px) < 21:
+                raise ValueError("insufficient history")
 
-        results[ticker] = {
-            "score":      round(float(score), 2),
-            "norm":       norm,
-            "count":      len(headlines) if headlines else (1 if source == "gdelt" else 0),
-            "tone_label": "Bullish" if norm > 0.1 else ("Bearish" if norm < -0.1 else "Neutral"),
-            "headlines":  headlines[:5],
-            "source":     source,
-            "error":      error,
-        }
+            # ── RSI-14 ────────────────────────────────────────────────────
+            delta  = px.diff()
+            gain   = delta.clip(lower=0).rolling(14).mean()
+            loss   = (-delta.clip(upper=0)).rolling(14).mean()
+            rs     = gain / loss.replace(0, np.nan)
+            rsi    = (100 - 100 / (1 + rs)).iloc[-1]
+            rsi_score = (float(rsi) - 50) / 50          # -1…+1, 0 = neutral
+
+            # ── Price vs 20d SMA ──────────────────────────────────────────
+            sma20     = px.tail(20).mean()
+            sma_score = float((px.iloc[-1] - sma20) / sma20) * 10
+            sma_score = max(-1.0, min(1.0, sma_score))
+
+            # ── Volume trend (5d vs 20d avg) ──────────────────────────────
+            if len(vol) >= 20:
+                vol_5d   = vol.tail(5).mean()
+                vol_20d  = vol.tail(20).mean()
+                vol_ratio = float(vol_5d / vol_20d) if vol_20d > 0 else 1.0
+                # Rising volume amplifies price direction; use sma_score as direction
+                vol_mod   = (vol_ratio - 1.0) * np.sign(sma_score)
+                vol_score = max(-1.0, min(1.0, vol_mod))
+            else:
+                vol_score = 0.0
+
+            # ── Blend: RSI 40%, SMA 40%, Volume 20% ──────────────────────
+            blended = 0.40 * rsi_score + 0.40 * sma_score + 0.20 * vol_score
+            blended = round(max(-1.0, min(1.0, blended)), 3)
+
+            # Convert to GDELT-compatible score (scale ×8 to match old range)
+            raw_score = round(blended * 8.0, 2)
+
+            results[ticker] = {
+                "score":      raw_score,
+                "norm":       blended,
+                "count":      int(len(px)),          # reused as "data points"
+                "tone_label": "Bullish"  if blended >  0.10
+                         else "Bearish"  if blended < -0.10
+                         else "Neutral",
+                "headlines":  [],                    # no headlines from price data
+                "source":     "technical",
+                "error":      None,
+                # Extra fields exposed in UI
+                "rsi":        round(float(rsi), 1),
+                "sma_pct":    round(float((px.iloc[-1] - sma20) / sma20 * 100), 2),
+                "vol_ratio":  round(vol_ratio if len(vol) >= 20 else 1.0, 2),
+            }
+
+        except Exception as exc:
+            results[ticker] = {
+                "score": 0.0, "norm": 0.0, "count": 0,
+                "tone_label": "N/A", "headlines": [],
+                "source": "unavailable", "error": str(exc),
+                "rsi": None, "sma_pct": None, "vol_ratio": None,
+            }
 
     return results
+
 
 def compute_volatility_weights(prices: pd.DataFrame) -> pd.Series:
     log_ret = np.log(prices / prices.shift(1)).dropna()
@@ -715,7 +699,6 @@ with st.spinner("Fetching market data…"):
 
     try:
         prices_all = fetch_price_data(all_tickers, period="1y")
-        # ensure all expected columns present
         available   = [t for t in all_tickers if t in prices_all.columns]
         prices_all  = prices_all[available].ffill()
         data_ok     = True
@@ -723,10 +706,21 @@ with st.spinner("Fetching market data…"):
         st.error(f"Data fetch failed: {e}")
         data_ok = False
 
+    # Volume data — 3 months is sufficient for 5d/20d averages
+    sector_tickers_list = list(SECTOR_ETFS.keys())
+    volumes_all = fetch_volume_data(sector_tickers_list, period="3mo")
+
+    # Put/Call ratios for sector ETFs
+    pcr_data = fetch_options_pcr(sector_tickers_list)
+
     gdp_trend, cpi_trend, gdp_vals, cpi_vals = fetch_fred_macro()
 
 if not data_ok:
     st.stop()
+
+# Technical sentiment — computed from price + volume already in memory
+sector_prices_for_sent = prices_all[[t for t in SECTOR_ETFS if t in prices_all.columns]]
+sentiment_data = compute_technical_sentiment(sector_prices_for_sent, volumes_all)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PART 1 — CORE EQUITY (Age-Adjusted Risk Parity)
@@ -1112,41 +1106,97 @@ with tab1:
 # ─── TAB 2 — SECTOR MOMENTUM ─────────────────────────────────────────────────
 with tab2:
     st.markdown('<div class="aw-card">', unsafe_allow_html=True)
-    st.markdown('<div class="aw-card-title">📈 S&P 500 Sector 3-Month Momentum Ranking</div>', unsafe_allow_html=True)
+    st.markdown('<div class="aw-card-title">📈 S&P 500 Sector Momentum — 3M Return · Volume · Put/Call</div>', unsafe_allow_html=True)
 
-    momentum_df = pd.DataFrame({
-        "Ticker": sector_returns.index,
-        "Sector": [SECTOR_ETFS.get(t, t) for t in sector_returns.index],
-        "3M Return": sector_returns.values,
-        "Selected": ["✓" if t in top3 else "" for t in sector_returns.index],
-        "Regime Aligned": ["✓" if t in quad_preferred else "" for t in sector_returns.index],
-    })
+    # Column header
+    st.markdown("""
+    <div style="display:flex;align-items:center;gap:16px;padding:6px 0 10px;
+                border-bottom:1px solid var(--border);
+                font-family:var(--mono);font-size:0.6rem;color:var(--muted);
+                letter-spacing:1px;text-transform:uppercase">
+      <div style="width:48px">ETF</div>
+      <div style="flex:1">Sector</div>
+      <div style="width:130px">3M Return</div>
+      <div style="width:68px;text-align:right">3M Ret</div>
+      <div style="width:76px;text-align:right">Rel Vol</div>
+      <div style="width:62px;text-align:right">P/C Ratio</div>
+      <div style="width:150px;text-align:right">Badges</div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    for _, row in momentum_df.iterrows():
-        ret   = row["3M Return"]
-        bar_w = min(abs(ret) * 200, 100)
-        bar_c = "#10b981" if ret >= 0 else "#ef4444"
-        sel_badge = '<span style="background:#3b82f6;color:white;padding:2px 7px;border-radius:3px;font-size:0.65rem;font-family:var(--mono)">SELECTED</span>' if row["Selected"] else ""
-        ra_badge  = '<span style="background:rgba(167,139,250,0.2);color:#a78bfa;padding:2px 7px;border-radius:3px;font-size:0.65rem;font-family:var(--mono);border:1px solid rgba(167,139,250,0.3)">REGIME</span>' if row["Regime Aligned"] else ""
+    for ticker in sector_returns.index:
+        ret      = sector_returns[ticker] if ticker in sector_returns.index else 0.0
+        bar_w    = min(abs(ret) * 200, 100)
+        bar_c    = "#10b981" if ret >= 0 else "#ef4444"
+        is_sel   = ticker in top3
+        is_reg   = ticker in quad_preferred
+
+        # ── Volume: relative volume (5d avg / 20d avg) ────────────────────
+        if ticker in volumes_all.columns and len(volumes_all[ticker].dropna()) >= 20:
+            v   = volumes_all[ticker].dropna()
+            rv  = float(v.tail(5).mean() / v.tail(20).mean())
+            rv_str   = f"{rv:.2f}×"
+            rv_color = "#10b981" if rv > 1.15 else ("#ef4444" if rv < 0.85 else "var(--muted)")
+            rv_label = "↑ high" if rv > 1.15 else ("↓ low" if rv < 0.85 else "avg")
+        else:
+            rv_str = "—"; rv_color = "var(--muted)"; rv_label = ""
+
+        # ── Put/Call ratio ────────────────────────────────────────────────
+        pcr = pcr_data.get(ticker)
+        if pcr is not None:
+            pcr_str   = f"{pcr:.2f}"
+            # >1.0 = more puts = bearish sentiment; <0.7 = more calls = bullish
+            pcr_color = "#ef4444" if pcr > 1.0 else ("#10b981" if pcr < 0.7 else "var(--muted)")
+            pcr_label = "bearish" if pcr > 1.0 else ("bullish" if pcr < 0.7 else "neutral")
+        else:
+            pcr_str = "—"; pcr_color = "var(--muted)"; pcr_label = ""
+
+        sel_badge = ('<span style="background:#3b82f6;color:white;padding:2px 6px;'
+                     'border-radius:3px;font-size:0.6rem;font-family:var(--mono)">SELECTED</span>'
+                     ) if is_sel else ""
+        ra_badge  = ('<span style="background:rgba(167,139,250,0.2);color:#a78bfa;padding:2px 6px;'
+                     'border-radius:3px;font-size:0.6rem;font-family:var(--mono);'
+                     'border:1px solid rgba(167,139,250,0.3)">REGIME</span>'
+                     ) if is_reg else ""
 
         st.markdown(f"""
         <div style="display:flex;align-items:center;gap:16px;padding:10px 0;
                     border-bottom:1px solid var(--border)">
-          <div style="font-family:var(--mono);font-weight:700;width:48px;color:var(--text)">{row['Ticker']}</div>
-          <div style="flex:1;font-size:0.8rem;color:var(--muted)">{row['Sector']}</div>
-          <div style="width:160px">
+          <div style="font-family:var(--mono);font-weight:700;width:48px;
+                      color:{'var(--text)' if is_sel else 'var(--muted)'}">{ticker}</div>
+          <div style="flex:1;font-size:0.78rem;color:var(--muted)">{SECTOR_ETFS.get(ticker, ticker)}</div>
+          <div style="width:130px">
             <div style="height:5px;background:var(--surface2);border-radius:2px;overflow:hidden">
-              <div style="height:100%;width:{bar_w}%;background:{bar_c};border-radius:2px"></div>
+              <div style="height:100%;width:{bar_w:.0f}%;background:{bar_c};border-radius:2px"></div>
             </div>
           </div>
-          <div style="font-family:var(--mono);font-size:0.85rem;width:60px;text-align:right;
+          <div style="font-family:var(--mono);font-size:0.82rem;width:68px;text-align:right;
                       color:{bar_c}">{ret*100:+.1f}%</div>
-          <div style="width:140px;display:flex;gap:6px;justify-content:flex-end">
+          <div style="font-family:var(--mono);font-size:0.78rem;width:76px;text-align:right">
+            <span style="color:{rv_color}">{rv_str}</span>
+            <span style="font-size:0.6rem;color:var(--muted);display:block">{rv_label}</span>
+          </div>
+          <div style="font-family:var(--mono);font-size:0.78rem;width:62px;text-align:right">
+            <span style="color:{pcr_color}">{pcr_str}</span>
+            <span style="font-size:0.6rem;color:var(--muted);display:block">{pcr_label}</span>
+          </div>
+          <div style="width:150px;display:flex;gap:5px;justify-content:flex-end;flex-wrap:wrap">
             {sel_badge}{ra_badge}
           </div>
         </div>
         """, unsafe_allow_html=True)
 
+    st.markdown("""
+    <div style="margin-top:12px;padding:10px 14px;background:var(--surface2);
+                border:1px solid var(--border);border-radius:6px;
+                font-size:0.7rem;color:var(--muted);font-family:var(--mono)">
+      <b style="color:var(--text)">Rel Vol</b> = 5d avg ÷ 20d avg volume.
+      &gt;1.15× = above-average participation · &lt;0.85× = low conviction.
+      &nbsp;&nbsp;<b style="color:var(--text)">P/C</b> = put/call volume ratio (nearest 2 expirations).
+      &gt;1.0 = net bearish positioning · &lt;0.7 = net bullish.
+      "—" = options data unavailable.
+    </div>
+    """, unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ─── TAB 3 — DRIFT REPORT ────────────────────────────────────────────────────
@@ -1190,7 +1240,7 @@ with tab3:
     target_df     = pd.DataFrame(target_rows)
     drift_tickers = target_df["Ticker"].tolist()
 
-    # ── JS: on page load push any saved localStorage values into URL params ─
+    # ── JS: load both current % AND cost basis from localStorage → URL params ─
     holdings_js_keys = ", ".join(f'"{t}"' for t in drift_tickers)
     st.components.v1.html(f"""
     <script>
@@ -1199,40 +1249,61 @@ with tab3:
       const params  = new URLSearchParams(window.parent.location.search);
       let changed   = false;
       tickers.forEach(t => {{
-        const v = localStorage.getItem("aw_drift_" + t);
-        if (v !== null && params.get("drift_" + t) !== v) {{
-          params.set("drift_" + t, v);
-          changed = true;
-        }}
+        const v  = localStorage.getItem("aw_drift_"  + t);
+        const cb = localStorage.getItem("aw_cb_"     + t);
+        const sh = localStorage.getItem("aw_shares_" + t);
+        if (v  !== null && params.get("drift_"  + t) !== v)  {{ params.set("drift_"  + t, v);  changed = true; }}
+        if (cb !== null && params.get("cb_"     + t) !== cb) {{ params.set("cb_"     + t, cb); changed = true; }}
+        if (sh !== null && params.get("shares_" + t) !== sh) {{ params.set("shares_" + t, sh); changed = true; }}
       }});
-      if (changed) {{
-        window.parent.history.replaceState(null, "", "?" + params.toString());
-      }}
+      if (changed) window.parent.history.replaceState(null, "", "?" + params.toString());
     }})();
     </script>
     """, height=0)
 
-    # ── Load saved Current % from query_params ─────────────────────────────
-    def _load_holding(ticker: str) -> float:
-        val = st.query_params.get(f"drift_{ticker}", "0.0")
-        try:
-            return float(val)
-        except (ValueError, TypeError):
-            return 0.0
+    # ── Load saved values from query_params ────────────────────────────────
+    def _load_float(key: str, default: float = 0.0) -> float:
+        val = st.query_params.get(key, str(default))
+        try:    return float(val)
+        except: return default
 
-    target_df["Current %"] = target_df["Ticker"].apply(_load_holding)
+    target_df["Current %"] = target_df["Ticker"].apply(
+        lambda t: _load_float(f"drift_{t}", 0.0))
+    target_df["Cost Basis"] = target_df["Ticker"].apply(
+        lambda t: _load_float(f"cb_{t}", 0.0))
+    target_df["Shares"] = target_df["Ticker"].apply(
+        lambda t: _load_float(f"shares_{t}", 0.0))
+
+    # ── Add live price and ATR stop for each ticker ────────────────────────
+    def _live_price(ticker):
+        if ticker in prices_all.columns:
+            return float(prices_all[ticker].iloc[-1])
+        return 0.0
+
+    def _atr_stop(ticker):
+        info = atr_data.get(ticker, {})
+        return info.get("stop", 0.0)
+
+    target_df["Live Price"] = target_df["Ticker"].apply(_live_price)
+    target_df["ATR Stop"]   = target_df["Ticker"].apply(_atr_stop)
 
     # ── Editable table ─────────────────────────────────────────────────────
     drift_edit = st.data_editor(
-        target_df[["Ticker", "Bucket", "Label", "Target %", "Current %"]],
+        target_df[["Ticker", "Bucket", "Label", "Target %",
+                   "Current %", "Shares", "Cost Basis"]],
         column_config={
-            "Ticker":    st.column_config.TextColumn("Ticker",   disabled=True),
-            "Bucket":    st.column_config.TextColumn("Bucket",   disabled=True),
-            "Label":     st.column_config.TextColumn("Name",     disabled=True),
-            "Target %":  st.column_config.NumberColumn("Target %", disabled=True, format="%.1f"),
-            "Current %": st.column_config.NumberColumn(
-                "Current % ✏️", min_value=0.0, max_value=100.0, step=0.1, format="%.1f"
-            ),
+            "Ticker":     st.column_config.TextColumn("Ticker",    disabled=True),
+            "Bucket":     st.column_config.TextColumn("Bucket",    disabled=True),
+            "Label":      st.column_config.TextColumn("Name",      disabled=True),
+            "Target %":   st.column_config.NumberColumn("Target %", disabled=True, format="%.1f"),
+            "Current %":  st.column_config.NumberColumn(
+                "Current % ✏️", min_value=0.0, max_value=100.0, step=0.1, format="%.1f"),
+            "Shares":     st.column_config.NumberColumn(
+                "Shares ✏️", min_value=0.0, step=1.0, format="%.0f",
+                help="Number of shares you currently hold"),
+            "Cost Basis": st.column_config.NumberColumn(
+                "Cost Basis ✏️", min_value=0.0, step=0.01, format="$%.2f",
+                help="Average cost per share (used for P&L and stop-loss monitoring)"),
         },
         use_container_width=True,
         hide_index=True,
@@ -1257,21 +1328,82 @@ with tab3:
 
     if save_drift:
         for _, row in drift_edit.iterrows():
-            st.query_params[f"drift_{row['Ticker']}"] = str(row["Current %"])
+            t = row["Ticker"]
+            st.query_params[f"drift_{t}"]  = str(row["Current %"])
+            st.query_params[f"cb_{t}"]     = str(row["Cost Basis"])
+            st.query_params[f"shares_{t}"] = str(row["Shares"])
         js_lines = "\n".join(
-            f'localStorage.setItem("aw_drift_{row["Ticker"]}", "{row["Current %"]}");'
-            for _, row in drift_edit.iterrows()
+            f'localStorage.setItem("aw_drift_{r["Ticker"]}",  "{r["Current %"]}");'
+            f'localStorage.setItem("aw_cb_{r["Ticker"]}",     "{r["Cost Basis"]}");'
+            f'localStorage.setItem("aw_shares_{r["Ticker"]}", "{r["Shares"]}");'
+            for _, r in drift_edit.iterrows()
         )
         st.components.v1.html(f"<script>{js_lines}</script>", height=0)
-        st.success("✓ Holdings saved — will reload automatically on your next visit.", icon="💾")
+        st.success("✓ Holdings, shares, and cost bases saved.", icon="💾")
 
-    # ── Drift calculations ─────────────────────────────────────────────────
+    # ── Drift + P&L + stop-loss calculations ──────────────────────────────
     drift_edit["Drift %"] = (drift_edit["Current %"] - drift_edit["Target %"]).round(2)
     drift_edit["Action"]  = drift_edit["Drift %"].apply(
         lambda d: "▲ BUY" if d < -1 else ("▼ SELL" if d > 1 else "✓ OK")
     )
+    # Merge live price and ATR stop back in
+    drift_edit["Live Price"] = target_df["Live Price"].values
+    drift_edit["ATR Stop"]   = target_df["ATR Stop"].values
 
-    st.markdown("<div style='margin-top:24px'>", unsafe_allow_html=True)
+    # P&L per position
+    def _pnl(row):
+        cb    = row["Cost Basis"]
+        px    = row["Live Price"]
+        sh    = row["Shares"]
+        if cb > 0 and px > 0 and sh > 0:
+            return round((px - cb) * sh, 2)
+        return None
+
+    def _pnl_pct(row):
+        cb = row["Cost Basis"]
+        px = row["Live Price"]
+        if cb > 0 and px > 0:
+            return round((px - cb) / cb * 100, 2)
+        return None
+
+    def _stop_triggered(row):
+        cb   = row["Cost Basis"]
+        stop = row["ATR Stop"]
+        px   = row["Live Price"]
+        if cb > 0 and stop > 0 and px > 0:
+            return px <= stop
+        return False
+
+    drift_edit["P&L $"]    = drift_edit.apply(_pnl, axis=1)
+    drift_edit["P&L %"]    = drift_edit.apply(_pnl_pct, axis=1)
+    drift_edit["Stopped"]  = drift_edit.apply(_stop_triggered, axis=1)
+
+    # ── Stop-loss alerts (show before the detail rows) ────────────────────
+    stopped_positions = drift_edit[drift_edit["Stopped"] == True]
+    if not stopped_positions.empty:
+        for _, sp in stopped_positions.iterrows():
+            st.markdown(f"""
+            <div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.4);
+                        border-radius:8px;padding:12px 16px;margin-bottom:8px;
+                        display:flex;align-items:center;gap:12px">
+              <span style="font-size:1.4rem">🚨</span>
+              <div>
+                <div style="font-family:var(--mono);font-weight:700;color:#ef4444">
+                  STOP-LOSS TRIGGERED — {sp['Ticker']}
+                </div>
+                <div style="font-size:0.78rem;color:var(--muted);margin-top:2px">
+                  Live price <b style="color:#ef4444">${sp['Live Price']:.2f}</b>
+                  has breached 2×ATR stop of
+                  <b style="color:#ef4444">${sp['ATR Stop']:.2f}</b>.
+                  Cost basis: ${sp['Cost Basis']:.2f} ·
+                  P&L: <b style="color:#ef4444">${sp['P&L $']:,.0f}</b>
+                  ({sp['P&L %']:+.1f}%)
+                </div>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    st.markdown("<div style='margin-top:16px'>", unsafe_allow_html=True)
     for _, row in drift_edit.iterrows():
         drift  = row["Drift %"]
         action = row["Action"]
@@ -1280,6 +1412,35 @@ with tab3:
         target_bar  = min(row["Target %"],  scale) / scale * 100
         current_bar = min(row["Current %"], scale) / scale * 100
         bucket_color = {"Core": "#3b82f6", "Tactical": "#10b981", "Hedge": "#f59e0b"}.get(row["Bucket"], "#64748b")
+
+        # P&L display
+        pnl_d   = row["P&L $"]
+        pnl_pct = row["P&L %"]
+        cb      = row["Cost Basis"]
+        px      = row["Live Price"]
+        stop    = row["ATR Stop"]
+        stopped = row["Stopped"]
+
+        has_cb = cb > 0 and px > 0
+        pnl_html = ""
+        if has_cb:
+            pnl_color  = "#10b981" if (pnl_d or 0) >= 0 else "#ef4444"
+            stop_color = "#ef4444" if stopped else "var(--muted)"
+            stop_badge = ('<span style="background:rgba(239,68,68,0.15);color:#ef4444;'
+                          'font-family:var(--mono);font-size:0.6rem;padding:1px 6px;'
+                          'border-radius:3px;border:1px solid rgba(239,68,68,0.3)">'
+                          '🚨 STOPPED</span> ') if stopped else ""
+            pnl_html = f"""
+            <div style="margin-top:8px;padding:8px 10px;background:rgba(255,255,255,0.03);
+                        border-radius:4px;display:flex;gap:16px;flex-wrap:wrap;
+                        font-family:var(--mono);font-size:0.7rem">
+              {stop_badge}
+              <span>Cost: <b>${cb:.2f}</b></span>
+              <span>Price: <b style="color:{'#10b981' if px >= cb else '#ef4444'}">${px:.2f}</b></span>
+              <span>P&L: <b style="color:{pnl_color}">${pnl_d:,.0f} ({pnl_pct:+.1f}%)</b></span>
+              <span style="color:{stop_color}">Stop: ${stop:.2f}</span>
+            </div>"""
+
         st.markdown(f"""
         <div style="padding:14px 0;border-bottom:1px solid var(--border)">
           <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
@@ -1307,6 +1468,7 @@ with tab3:
             </div>
             <span style="width:38px;text-align:right">{row['Current %']:.1f}%</span>
           </div>
+          {pnl_html}
         </div>
         """, unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1432,36 +1594,37 @@ with tab4:
 
 with tab5:
     st.markdown('<div class="aw-card">', unsafe_allow_html=True)
-    st.markdown('<div class="aw-card-title">📰 Narrative Radar — GDELT Sentiment × Sector Tilt</div>', unsafe_allow_html=True)
+    st.markdown('<div class="aw-card-title">📡 Technical Sentiment Radar — RSI · SMA · Volume</div>', unsafe_allow_html=True)
     st.markdown(f"""
-    <div style="font-size:0.8rem;color:var(--muted);margin-bottom:20px">
-      News sentiment from the <b>GDELT Global Knowledge Graph</b> (7-day window, English sources)
-      scored against your current tactical tilts: <b style="color:#10b981">{', '.join(top3)}</b>.
-      Sentiment tone adjusts conviction — strong narrative tailwinds reinforce holds;
-      headwinds flag positions for closer monitoring.
+    <div style="font-size:0.8rem;color:var(--muted);margin-bottom:16px">
+      Sentiment derived from <b>price action and volume</b> — no external API dependency.
+      Signals: RSI-14 (40%), price vs 20d SMA (40%), volume trend 5d/20d (20%).
+      Scored against current tactical tilts: <b style="color:#10b981">{', '.join(top3)}</b>.
+    </div>
+    <div style="display:inline-flex;align-items:center;gap:8px;margin-bottom:20px;
+                padding:6px 12px;background:rgba(16,185,129,0.08);
+                border:1px solid rgba(16,185,129,0.2);border-radius:5px">
+      <span style="color:#10b981;font-family:var(--mono);font-size:0.65rem;letter-spacing:1px">
+        ● TECHNICAL SIGNALS
+      </span>
+      <span style="font-size:0.68rem;color:var(--muted)">computed from yfinance price + volume · refreshes hourly</span>
     </div>
     """, unsafe_allow_html=True)
 
-    # Fetch GDELT for all 11 sectors so we can show the full radar, not just top3
-    all_sector_tickers = list(SECTOR_ETFS.keys())
-
-    with st.spinner("Fetching GDELT sentiment data (7-day window)…"):
-        gdelt_data = fetch_gdelt_sentiment(tuple(all_sector_tickers))
-
-    # ── Conviction score: blend momentum rank + sentiment norm ────────────
-    # momentum_rank: 1 (best) to 11 (worst), inverted to 0–1
+    # ── Conviction score: blend momentum rank + technical sentiment ────────
     momentum_rank = {t: i for i, t in enumerate(sector_returns.index)}
     n_sectors     = len(momentum_rank)
+    all_sector_tickers = list(SECTOR_ETFS.keys())
 
     conviction = {}
     for ticker in all_sector_tickers:
-        mom_score  = 1.0 - (momentum_rank.get(ticker, n_sectors) / n_sectors)  # 0–1
-        sent_norm  = gdelt_data[ticker]["norm"]                                  # -1 to +1
-        sent_score = (sent_norm + 1) / 2                                         # rescale to 0–1
-        # 60% momentum, 40% sentiment — momentum remains primary signal
+        mom_score  = 1.0 - (momentum_rank.get(ticker, n_sectors) / n_sectors)
+        sent       = sentiment_data.get(ticker, {})
+        sent_norm  = sent.get("norm", 0.0)
+        sent_score = (sent_norm + 1) / 2                  # rescale -1…+1 → 0…1
         combined   = round(0.60 * mom_score + 0.40 * sent_score, 3)
         conviction[ticker] = {
-            "momentum_score": round(mom_score,  3),
+            "momentum_score":  round(mom_score,  3),
             "sentiment_score": round(sent_score, 3),
             "combined":        combined,
             "recommendation":  "STRONG HOLD" if combined > 0.70
@@ -1470,36 +1633,12 @@ with tab5:
                                else "REDUCE",
         }
 
-    # ── Data source summary ────────────────────────────────────────────────
-    source_counts = {}
-    for v in gdelt_data.values():
-        s = v.get("source", "unavailable")
-        source_counts[s] = source_counts.get(s, 0) + 1
-
-    source_badges = []
     badge_map = {
-        "gdelt":       ("GDELT LIVE",   "#10b981"),
-        "rss":         ("RSS FALLBACK", "#f59e0b"),
-        "unavailable": ("NO DATA",      "#ef4444"),
+        "technical":   ("TECHNICAL", "#10b981"),
+        "unavailable": ("NO DATA",   "#ef4444"),
     }
-    for src, count in source_counts.items():
-        label, color = badge_map.get(src, (src.upper(), "#64748b"))
-        source_badges.append(
-            f'<span style="background:rgba(255,255,255,0.05);border:1px solid {color}33;'
-            f'color:{color};font-family:var(--mono);font-size:0.62rem;'
-            f'padding:3px 8px;border-radius:3px">'
-            f'{label} ({count})</span>'
-        )
 
-    st.markdown(f"""
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:20px;flex-wrap:wrap">
-      <span style="font-size:0.72rem;color:var(--muted)">Data sources:</span>
-      {"".join(source_badges)}
-      <span style="font-size:0.68rem;color:var(--muted);margin-left:4px">· refreshes every 30 min</span>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ── Top-level summary: conviction for current tactical positions ───────
+    # ── Detailed cards for current tactical positions ──────────────────────
     st.markdown("""
     <div style="font-family:var(--mono);font-size:0.65rem;letter-spacing:2px;
                 text-transform:uppercase;color:var(--muted);margin-bottom:12px">
@@ -1508,22 +1647,38 @@ with tab5:
     """, unsafe_allow_html=True)
 
     for ticker in top3:
-        g    = gdelt_data[ticker]
-        c    = conviction[ticker]
-        rec  = c["recommendation"]
+        g   = sentiment_data.get(ticker, {})
+        c   = conviction[ticker]
+        rec = c["recommendation"]
         rec_color = {
-            "STRONG HOLD": "#10b981",
-            "HOLD":        "#3b82f6",
-            "MONITOR":     "#f59e0b",
-            "REDUCE":      "#ef4444",
+            "STRONG HOLD": "#10b981", "HOLD": "#3b82f6",
+            "MONITOR": "#f59e0b",     "REDUCE": "#ef4444",
         }.get(rec, "#64748b")
 
-        tone_color = "#10b981" if g["norm"] > 0.1 else ("#ef4444" if g["norm"] < -0.1 else "#64748b")
+        norm       = g.get("norm", 0.0)
+        tone_color = "#10b981" if norm > 0.1 else ("#ef4444" if norm < -0.1 else "#64748b")
         bar_w      = int(c["combined"] * 100)
         mom_bar    = int(c["momentum_score"] * 100)
         sent_bar   = int(c["sentiment_score"] * 100)
         aligned    = "✓ regime" if ticker in quad_preferred else "↑ momentum"
         aligned_c  = "var(--accent)" if ticker in quad_preferred else "var(--accent3)"
+
+        rsi      = g.get("rsi")
+        sma_pct  = g.get("sma_pct")
+        vol_ratio= g.get("vol_ratio")
+        rsi_str     = f"{rsi:.1f}" if rsi is not None else "—"
+        sma_str     = f"{sma_pct:+.2f}%" if sma_pct is not None else "—"
+        vol_str     = f"{vol_ratio:.2f}×" if vol_ratio is not None else "—"
+        rsi_c    = "#10b981" if (rsi or 50) > 60 else ("#ef4444" if (rsi or 50) < 40 else "#64748b")
+        sma_c    = "#10b981" if (sma_pct or 0) > 0 else "#ef4444"
+        vol_c    = "#10b981" if (vol_ratio or 1) > 1.1 else ("#ef4444" if (vol_ratio or 1) < 0.9 else "#64748b")
+
+        # PCR for this ticker
+        pcr = pcr_data.get(ticker)
+        pcr_str   = f"{pcr:.2f}" if pcr is not None else "—"
+        pcr_color = "#ef4444" if (pcr or 0) > 1.0 else ("#10b981" if (pcr or 0) < 0.7 else "#64748b")
+
+        src_label, src_color = badge_map.get(g.get("source", "unavailable"), ("N/A", "#64748b"))
 
         st.markdown(f"""
         <div style="padding:18px 20px;background:var(--surface2);border:1px solid var(--border);
@@ -1536,37 +1691,34 @@ with tab5:
                 <span style="font-size:0.75rem;color:var(--muted)">{SECTOR_ETFS.get(ticker,'')}</span>
                 <span style="font-size:0.65rem;color:{aligned_c};font-family:var(--mono)">{aligned}</span>
               </div>
-              <div style="font-size:0.75rem;color:var(--muted)">
-                GDELT articles (7d): <b style="color:var(--text)">{g['count']}</b>
-                &nbsp;·&nbsp; Avg tone: <b style="color:{tone_color}">{g['score']:+.2f}</b>
-                &nbsp;·&nbsp; Signal: <b style="color:{tone_color}">{g['tone_label']}</b>
-                &nbsp;·&nbsp;
-                <span style="font-family:var(--mono);font-size:0.65rem;
-                  color:{badge_map.get(g.get('source','unavailable'),('','#64748b'))[1]}">
-                  {badge_map.get(g.get('source','unavailable'),('N/A','#64748b'))[0]}
-                </span>
+              <div style="display:flex;gap:16px;font-size:0.72rem;flex-wrap:wrap">
+                <span>RSI-14: <b style="color:{rsi_c}">{rsi_str}</b></span>
+                <span>vs SMA20: <b style="color:{sma_c}">{sma_str}</b></span>
+                <span>Rel Vol: <b style="color:{vol_c}">{vol_str}</b></span>
+                <span>P/C: <b style="color:{pcr_color}">{pcr_str}</b></span>
+                <span style="color:{src_color};font-family:var(--mono);font-size:0.62rem">{src_label}</span>
               </div>
             </div>
             <div style="text-align:right">
               <div style="font-family:var(--mono);font-size:0.6rem;color:var(--muted);
                           letter-spacing:1px;margin-bottom:4px">CONVICTION</div>
               <div style="font-family:var(--mono);font-size:1.4rem;font-weight:700;
-                          color:{rec_color}">{int(c['combined']*100)}</div>
+                          color:{rec_color}">{bar_w}</div>
               <div style="font-family:var(--mono);font-size:0.65rem;color:{rec_color};
                           letter-spacing:1px">{rec}</div>
             </div>
           </div>
 
-          <div style="margin-bottom:8px">
+          <div style="margin-bottom:6px">
             <div style="display:flex;justify-content:space-between;font-size:0.65rem;
                         color:var(--muted);font-family:var(--mono);margin-bottom:3px">
-              <span>Combined conviction</span><span>{c['combined']*100:.0f}/100</span>
+              <span>Combined conviction</span><span>{bar_w}/100</span>
             </div>
             <div style="height:6px;background:rgba(255,255,255,0.05);border-radius:3px">
               <div style="height:100%;width:{bar_w}%;background:{rec_color};border-radius:3px"></div>
             </div>
           </div>
-          <div style="display:flex;gap:16px">
+          <div style="display:flex;gap:12px">
             <div style="flex:1">
               <div style="display:flex;justify-content:space-between;font-size:0.62rem;
                           color:var(--muted);font-family:var(--mono);margin-bottom:3px">
@@ -1579,93 +1731,112 @@ with tab5:
             <div style="flex:1">
               <div style="display:flex;justify-content:space-between;font-size:0.62rem;
                           color:var(--muted);font-family:var(--mono);margin-bottom:3px">
-                <span>Sentiment (40%)</span><span>{sent_bar}</span>
+                <span>Technical (40%)</span><span>{sent_bar}</span>
               </div>
               <div style="height:4px;background:rgba(255,255,255,0.05);border-radius:2px">
                 <div style="height:100%;width:{sent_bar}%;background:{tone_color};border-radius:2px"></div>
               </div>
             </div>
           </div>
-
-          {f"""<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
-            <div style="font-family:var(--mono);font-size:0.6rem;color:var(--muted);
-                        letter-spacing:1px;margin-bottom:8px">RECENT HEADLINES</div>
-            {"".join(f'<div style="font-size:0.75rem;color:var(--muted);padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.04);line-height:1.4"><span style=color:rgba(255,255,255,0.15)>›</span> {h["title"][:110]}{"…" if len(h["title"])>110 else ""}</div>' for h in g["headlines"][:3])}
-          </div>""" if g['headlines'] else ""}
         </div>
         """, unsafe_allow_html=True)
 
-    # ── Full sector radar ──────────────────────────────────────────────────
+    # ── Full sector scan ───────────────────────────────────────────────────
     st.markdown("""
     <div style="font-family:var(--mono);font-size:0.65rem;letter-spacing:2px;
-                text-transform:uppercase;color:var(--muted);margin:24px 0 12px">
-      Full Sector Narrative Scan
+                text-transform:uppercase;color:var(--muted);margin:24px 0 8px">
+      Full Sector Scan
+    </div>
+    <div style="display:flex;gap:16px;padding:6px 0 8px;border-bottom:1px solid var(--border);
+                font-family:var(--mono);font-size:0.58rem;color:var(--muted);
+                letter-spacing:1px;text-transform:uppercase">
+      <div style="width:46px">ETF</div>
+      <div style="width:110px">Sector</div>
+      <div style="flex:1">Conviction bar</div>
+      <div style="width:34px;text-align:right">Score</div>
+      <div style="width:52px;text-align:right">3M Ret</div>
+      <div style="width:52px;text-align:right">RSI</div>
+      <div style="width:52px;text-align:right">Rel Vol</div>
+      <div style="width:60px;text-align:right">P/C</div>
+      <div style="width:76px;text-align:right">Signal</div>
     </div>
     """, unsafe_allow_html=True)
 
-    # Sort by combined conviction descending
     sorted_sectors = sorted(all_sector_tickers,
                             key=lambda t: conviction[t]["combined"], reverse=True)
 
     for ticker in sorted_sectors:
-        g    = gdelt_data[ticker]
-        c    = conviction[ticker]
-        rec  = c["recommendation"]
+        g   = sentiment_data.get(ticker, {})
+        c   = conviction[ticker]
+        rec = c["recommendation"]
         is_selected = ticker in top3
         rec_color = {
             "STRONG HOLD": "#10b981", "HOLD": "#3b82f6",
             "MONITOR": "#f59e0b",     "REDUCE": "#ef4444",
         }.get(rec, "#64748b")
-        tone_color = "#10b981" if g["norm"] > 0.1 else ("#ef4444" if g["norm"] < -0.1 else "#64748b")
-        bar_w = int(c["combined"] * 100)
-        ret   = sector_returns[ticker] if ticker in sector_returns.index else 0.0
-        ret_c = "#10b981" if ret >= 0 else "#ef4444"
-        sel_badge = f'<span style="background:#10b981;color:#0a0c10;font-family:var(--mono);font-size:0.58rem;padding:2px 7px;border-radius:3px;font-weight:700;margin-left:6px">TACTICAL</span>' if is_selected else ""
+
+        norm      = g.get("norm", 0.0)
+        tone_color= "#10b981" if norm > 0.1 else ("#ef4444" if norm < -0.1 else "#64748b")
+        ret       = sector_returns[ticker] if ticker in sector_returns.index else 0.0
+        ret_c     = "#10b981" if ret >= 0 else "#ef4444"
+        bar_w     = int(c["combined"] * 100)
+        rsi       = g.get("rsi")
+        vol_ratio = g.get("vol_ratio")
+        pcr       = pcr_data.get(ticker)
+
+        rsi_str = f"{rsi:.0f}" if rsi is not None else "—"
+        rsi_c   = "#10b981" if (rsi or 50) > 60 else ("#ef4444" if (rsi or 50) < 40 else "var(--muted)")
+        vr_str  = f"{vol_ratio:.2f}×" if vol_ratio is not None else "—"
+        vr_c    = "#10b981" if (vol_ratio or 1) > 1.1 else ("#ef4444" if (vol_ratio or 1) < 0.9 else "var(--muted)")
+        pcr_str = f"{pcr:.2f}" if pcr is not None else "—"
+        pcr_c   = "#ef4444" if (pcr or 0) > 1.0 else ("#10b981" if (pcr or 0) < 0.7 else "var(--muted)")
+
+        sel_badge = ('<span style="background:#10b981;color:#0a0c10;font-family:var(--mono);'
+                     'font-size:0.58rem;padding:1px 6px;border-radius:3px;'
+                     'font-weight:700;margin-left:4px">TAC</span>') if is_selected else ""
 
         st.markdown(f"""
-        <div style="display:flex;align-items:center;gap:12px;padding:10px 0;
+        <div style="display:flex;align-items:center;gap:16px;padding:9px 0;
                     border-bottom:1px solid var(--border)">
           <div style="width:46px;font-family:var(--mono);font-size:0.82rem;
                       font-weight:700;color:{'var(--text)' if is_selected else 'var(--muted)'}">{ticker}</div>
-          <div style="width:110px;font-size:0.72rem;color:var(--muted)">
+          <div style="width:110px;font-size:0.7rem;color:var(--muted)">
             {SECTOR_ETFS.get(ticker,'')} {sel_badge}
           </div>
           <div style="flex:1;height:5px;background:var(--surface2);border-radius:3px">
             <div style="height:100%;width:{bar_w}%;background:{rec_color};border-radius:3px;
-                        opacity:{'1' if is_selected else '0.5'}"></div>
+                        opacity:{'1' if is_selected else '0.55'}"></div>
           </div>
           <div style="width:34px;text-align:right;font-family:var(--mono);font-size:0.75rem;
                       color:{rec_color}">{bar_w}</div>
-          <div style="width:60px;text-align:right;font-family:var(--mono);font-size:0.72rem;
+          <div style="width:52px;text-align:right;font-family:var(--mono);font-size:0.72rem;
                       color:{ret_c}">{ret*100:+.1f}%</div>
-          <div style="width:68px;text-align:right;font-family:var(--mono);font-size:0.65rem;
-                      color:{tone_color}">{g['tone_label']}</div>
-          <div style="width:80px;text-align:right;font-family:var(--mono);font-size:0.65rem;
+          <div style="width:52px;text-align:right;font-family:var(--mono);font-size:0.72rem;
+                      color:{rsi_c}">{rsi_str}</div>
+          <div style="width:52px;text-align:right;font-family:var(--mono);font-size:0.72rem;
+                      color:{vr_c}">{vr_str}</div>
+          <div style="width:60px;text-align:right;font-family:var(--mono);font-size:0.72rem;
+                      color:{pcr_c}">{pcr_str}</div>
+          <div style="width:76px;text-align:right;font-family:var(--mono);font-size:0.65rem;
                       color:{rec_color};letter-spacing:0.5px">{rec}</div>
         </div>
         """, unsafe_allow_html=True)
 
-    # ── Methodology note ───────────────────────────────────────────────────
-    st.markdown(f"""
-    <div style="margin-top:24px;padding:16px 20px;background:rgba(59,130,246,0.06);
+    st.markdown("""
+    <div style="margin-top:20px;padding:16px 20px;background:rgba(59,130,246,0.06);
                 border:1px solid rgba(59,130,246,0.15);border-radius:8px;
                 font-size:0.77rem;color:var(--muted);line-height:1.6">
       <b style="color:#3b82f6;font-family:var(--mono)">METHODOLOGY</b><br><br>
-      <b style="color:var(--text)">Conviction score</b> = 60% momentum rank + 40% GDELT sentiment.
-      Momentum remains the primary signal; sentiment acts as a confirming or cautioning overlay.
-      A high-momentum sector with negative narrative (e.g. energy during a regulatory crackdown)
-      will show reduced conviction relative to pure price action.<br><br>
-      <b style="color:var(--text)">GDELT tone</b> is the average
-      <i>DocumentTone</i> across English-language articles matching sector keywords over a
-      7-day rolling window. Scores &gt; +0.10 normalized = Bullish;
-      &lt; -0.10 = Bearish; otherwise Neutral. Data refreshes every 30 minutes.
+      <b style="color:var(--text)">Conviction</b> = 60% 3-month momentum rank + 40% technical sentiment.
+      <b style="color:var(--text)">Technical sentiment</b> = 40% RSI-14 + 40% price vs 20d SMA + 20% relative volume (5d/20d).
+      All signals computed from price/volume data already fetched — no external API calls.
+      <b style="color:var(--text)">P/C ratio</b> from yfinance options chains (nearest 2 expirations); shown as context only, not included in conviction score.
       <br><br>
-      <b style="color:var(--text)">Recommendation thresholds:</b>
+      <b style="color:var(--text)">Thresholds:</b>
       STRONG HOLD ≥ 70 · HOLD 55–70 · MONITOR 40–55 · REDUCE &lt; 40
     </div>
     """, unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
-
 
 
 st.markdown(f"""
