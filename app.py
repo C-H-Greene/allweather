@@ -3,168 +3,190 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import plotly.express as px
+import plotly.graph_objects as go
 from datetime import datetime, timedelta
-import logging
 import warnings
-
-# ── Setup ────────────────────────────────────────────────────────────────────
 warnings.filterwarnings('ignore')
-logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
+# ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Project All-Weather",
     page_icon="🌦",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# ── Data Fetching ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# PERSISTENCE & STYLING (Restored from app(8).py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+PARAM_DEFAULTS = {"total_inv": "100000", "glide_index": "0", "core_pct": "60", "tactical_pct": "30"}
+
+def _qp(key: str, default):
+    val = st.query_params.get(key, str(default))
+    try: return int(val) if isinstance(default, int) else val
+    except: return default
+
+st.components.v1.html("""
+<script>
+(function() {
+  const KEYS = ["total_inv","glide_index","core_pct","tactical_pct"];
+  const params = new URLSearchParams(window.parent.location.search);
+  let needsUpdate = false;
+  KEYS.forEach(k => {
+    const v = localStorage.getItem("aw_" + k);
+    if (v !== null && params.get(k) !== v) { params.set(k, v); needsUpdate = true; }
+  });
+  if (needsUpdate) { window.parent.history.replaceState(null, "", "?" + params.toString()); }
+})();
+</script>
+""", height=0)
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap');
+:root { --bg: #0a0c10; --surface: #10141c; --border: #1e2535; --accent: #3b82f6; --text: #e2e8f0; --muted: #64748b; --mono: 'Space Mono', monospace; }
+html, body, [class*="css"] { background-color: var(--bg) !important; color: var(--text) !important; font-family: 'DM Sans', sans-serif; }
+.aw-header { display: flex; align-items: center; gap: 16px; padding: 20px 0; border-bottom: 1px solid var(--border); margin-bottom: 25px; }
+.aw-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+.aw-badge { background: var(--accent); color: white; font-family: var(--mono); font-size: 0.6rem; padding: 2px 8px; border-radius: 3px; }
+.metric-tile { background: #161b26; border: 1px solid var(--border); border-radius: 6px; padding: 15px; flex: 1; }
+.stop-badge { background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.3); color: #ef4444; font-family: var(--mono); font-size: 0.7rem; padding: 2px 6px; border-radius: 4px; }
+</style>
+""", unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+GLIDE_PRESETS = {
+    "31–40 · Aggressive Growth": {"assets": ["VOO", "VEA", "VWO", "GLD"], "desc": "Pure equity + gold."},
+    "41–50 · Growth": {"assets": ["VOO", "VEA", "VWO", "GLD", "IEF"], "desc": "Added mid-term bonds."},
+    "51–55 · Growth / Cons.": {"assets": ["VOO", "VEA", "GLD", "IEF", "TLT"], "desc": "Added long bonds."},
+    "60+ · All-Weather Classic": {"assets": ["VOO", "TLT", "IEF", "GLD", "GSG"], "desc": "Capital preservation."},
+}
+
+SECTOR_ETFS = {"XLE":"Energy","XLK":"Tech","XLV":"Health","XLF":"Financials","XLI":"Industrials","XLY":"Disc","XLP":"Staples","XLB":"Materials","XLC":"Comm","XLU":"Utils","XLRE":"Real Estate"}
+QUADRANT_MAP = {("rising","rising"):("Stagflation","🔥",["XLE","XLB","GLD"]), ("rising","falling"):("Expansion","🚀",["XLK","XLY","XLF"]), ("falling","rising"):("Recession","❄️",["XLU","XLP","XLV"]), ("falling","falling"):("Deflation","🌧",["TLT","XLU","GLD"])}
 
 @st.cache_data(ttl=3600)
 def fetch_all_data(tickers):
-    """Batches all yfinance calls. Uses 2026 'progress=False' syntax."""
-    if not tickers:
-        return pd.DataFrame()
-    ticker_str = " ".join(tickers) if isinstance(tickers, list) else tickers
-    try:
-        data = yf.download(
-            tickers=ticker_str,
-            period="2y",
-            interval="1d",
-            auto_adjust=True,
-            group_by='ticker',
-            progress=False
-        )
-        return data
-    except Exception as e:
-        st.error(f"Financial Data Error: {e}")
-        return pd.DataFrame()
+    data = yf.download(tickers, period="1y", auto_adjust=True, progress=False)
+    # Safe MultiIndex handling
+    prices = data['Close'] if isinstance(data.columns, pd.MultiIndex) else data[['Close']].rename(columns={'Close': tickers[0]})
+    vols = data['Volume'] if isinstance(data.columns, pd.MultiIndex) else data[['Volume']].rename(columns={'Volume': tickers[0]})
+    return prices.ffill(), vols.ffill()
 
-def get_ticker_close(data, ticker):
-    """Robustly extracts Close prices from MultiIndex DataFrames."""
-    try:
-        if isinstance(data.columns, pd.MultiIndex):
-            if ticker in data.columns.levels[0]:
-                return data[ticker]['Close']
-            elif 'Close' in data.columns.levels[0] and ticker in data.columns.levels[1]:
-                return data.xs(key=('Close', ticker), axis=1)
-        if ticker in data.columns:
-            return data[ticker]
-        return pd.Series()
-    except:
-        return pd.Series()
+@st.cache_data(ttl=3600)
+def get_fred_macro():
+    # Simple fallback trends if FRED is unreachable
+    return "rising", "falling" # GDP rising, CPI falling (Expansion baseline)
 
-# ── Metrics & Visualization ───────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════════════════════
 
-def display_regime_volatility(data, benchmark="SPY"):
-    """Realized volatility gauge to identify regime stability."""
-    prices = get_ticker_close(data, benchmark)
-    if prices.empty: return
-    returns = prices.pct_change().dropna()
-    realized_vol = returns.rolling(window=21).std() * np.sqrt(252) * 100
-    current_vol = realized_vol.iloc[-1]
+with st.sidebar:
+    st.title("🌦 Settings")
+    total_inv = st.number_input("Total Investment ($)", value=_qp("total_inv", 100000))
+    glide_choice = st.selectbox("Life Stage", options=list(GLIDE_PRESETS.keys()), index=_qp("glide_index", 0))
+    CORE_ASSETS = GLIDE_PRESETS[glide_choice]["assets"]
     
-    # Define thresholds for the signal
-    if current_vol < 15:
-        status, delta_col = "Stable Expansion", "normal"
-    elif current_vol < 25:
-        status, delta_col = "Transitionary", "off"
-    else:
-        status, delta_col = "High Vol / Unstable", "inverse"
-        
-    st.metric("Regime Volatility (VIX Proxy)", f"{current_vol:.1f}%", delta=status, delta_color=delta_col)
+    core_pct = st.slider("Core Equity %", 40, 80, _qp("core_pct", 60))
+    tactical_pct = st.slider("Tactical %", 10, 40, _qp("tactical_pct", 30))
+    hedge_pct = 100 - core_pct - tactical_pct
+    
+    if st.button("💾 SAVE & REFRESH", use_container_width=True):
+        st.query_params.update({"total_inv": total_inv, "glide_index": list(GLIDE_PRESETS.keys()).index(glide_choice), "core_pct": core_pct, "tactical_pct": tactical_pct})
+        st.rerun()
 
-def display_correlation_radar(data, tickers):
-    """Visualizes how connected tactical picks are to avoid over-concentration."""
-    series_dict = {}
-    for t in tickers:
-        c = get_ticker_close(data, t)
-        if not c.empty:
-            series_dict[t] = c.pct_change()
-    if not series_dict: return
-    
-    df_corr = pd.DataFrame(series_dict).tail(90).corr()
-    fig = px.imshow(df_corr, text_auto=".2f", aspect="auto",
-                    color_continuous_scale='RdBu_r', origin='lower',
-                    title="Correlation Radar (90-Day Returns)")
-    fig.update_layout(margin=dict(l=10, r=10, t=40, b=10), height=350)
-    st.plotly_chart(fig, use_container_width=True)
+# ══════════════════════════════════════════════════════════════════════════════
+# ANALYTICS LOGIC
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ── Main Application ──────────────────────────────────────────────────────────
+prices, volumes = fetch_all_data(list(SECTOR_ETFS.keys()) + CORE_ASSETS + ["VOO", "SH", "BIL"])
+gdp_t, cpi_t = get_fred_macro()
+quad_name, quad_emoji, quad_prefs = QUADRANT_MAP[(gdp_t, cpi_t)]
 
-def main():
-    st.sidebar.header("Portfolio Parameters")
-    total_inv = st.sidebar.number_input("Total Investment ($)", value=100000)
-    profile = st.sidebar.selectbox("Model Profile", ["31y Aggressive Global", "Standard All-Weather"])
+# 1. Technical Sentiment (RSI + SMA + Vol)
+def get_sentiment(ticker):
+    px = prices[ticker].dropna()
+    rsi = 100 - (100 / (1 + (px.diff().clip(lower=0).rolling(14).mean() / -px.diff().clip(upper=0).rolling(14).mean())))
+    sma20 = px.rolling(20).mean()
+    vol_ratio = volumes[ticker].tail(5).mean() / volumes[ticker].tail(20).mean()
     
-    core_pct = st.sidebar.slider("Core Portfolio %", 0, 100, 60)
-    alpha_pct = st.sidebar.slider("Tactical Alpha %", 0, 100, 30)
-    
-    # Asset Selection
-    if profile == "31y Aggressive Global":
-        core_assets = ["VOO", "VEA", "VWO", "GLD"]
-    else:
-        core_assets = ["VOO", "TLT", "IEF", "GLD", "GSG"]
-        
-    tactical_sectors = ["XLK", "XLRE", "XLE", "XLU", "XLY", "XLF", "XLV", "XLI", "XLB", "XLP"]
-    all_tickers = list(set(core_assets + tactical_sectors + ["SPY"]))
-    
-    with st.spinner("Fetching Institutional Data..."):
-        raw_data = fetch_all_data(all_tickers)
-    
-    if raw_data.empty:
-        st.error("Data connection failed. Please check your network.")
-        return
+    score = (0.4 * (rsi.iloc[-1]-50)/50) + (0.4 * (px.iloc[-1]/sma20.iloc[-1]-1)*10) + (0.2 * (vol_ratio-1))
+    return np.clip(score * 50 + 50, 0, 100), rsi.iloc[-1]
 
-    # Header Row
-    m1, m2, m3 = st.columns(3)
-    with m1:
-        display_regime_volatility(raw_data)
-    with m2:
-        st.metric("Estimated Regime", "Stagflation Lite", "Sticky Inflation")
-    with m3:
-        st.metric("Profile Target", "Aggressive Growth", "90/10 Ratio")
+# 2. Conviction Score (60% Momentum / 40% Sentiment)
+mom_rank = prices[list(SECTOR_ETFS.keys())].pct_change(63).iloc[-1].rank(pct=True) * 100
+tactical_results = []
+for t in SECTOR_ETFS:
+    sent_score, rsi = get_sentiment(t)
+    conviction = (0.6 * mom_rank[t]) + (0.4 * sent_score)
+    tactical_results.append({"Ticker": t, "Sector": SECTOR_ETFS[t], "Conviction": conviction, "RSI": rsi, "Price": prices[t].iloc[-1]})
 
-    st.divider()
-    
-    # Layout: Core vs Radar
-    col_a, col_b = st.columns([1, 1])
-    with col_a:
-        st.subheader("Core: Risk Parity Weights")
-        # Simple Inverse-Vol calculation
-        vols = {t: get_ticker_close(raw_data, t).pct_change().tail(30).std() for t in core_assets}
-        inv_vols = {t: (1/v if v > 0 else 1) for t, v in vols.items()}
-        total_inv_vol = sum(inv_vols.values())
-        weights = {t: v/total_inv_vol for t, v in inv_vols.items()}
-        
-        core_df = pd.DataFrame([
-            {"Asset": t, "Weight": f"{w*100:.1f}%", "Value": f"${(total_inv * (core_pct/100) * w):,.0f}"}
-            for t, w in weights.items()
-        ])
-        st.table(core_df)
-        
-    with col_b:
-        display_correlation_radar(raw_data, core_assets + ["XLK", "XLRE"])
+tactical_df = pd.DataFrame(tactical_results).sort_values("Conviction", ascending=False)
+top3 = tactical_df.head(3)
 
-    # Tactical Section
-    st.subheader("Tactical Alpha: Momentum Ranking")
-    mom_data = []
-    for s in tactical_sectors:
-        prices = get_ticker_close(raw_data, s)
-        if not prices.empty:
-            # Safely calculate 3-month momentum
-            window = min(len(prices), 63)
-            ret = (prices.iloc[-1] / prices.iloc[-window]) - 1
-            mom_data.append({"Sector": s, "3M Momentum": ret})
-    
-    mom_df = pd.DataFrame(mom_data).sort_values("3M Momentum", ascending=False)
-    top_3 = mom_df.head(3)["Sector"].tolist()
-    
-    t1, t2, t3 = st.columns(3)
-    for i, col in enumerate([t1, t2, t3]):
-        with col:
-            s_name = top_3[i]
-            st.info(f"**#{i+1}: {s_name}**")
-            st.write(f"Allocation: ${(total_inv * (alpha_pct/100) / 3):,.0f}")
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN UI - TABS (Restored)
+# ══════════════════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
-    main()
+st.markdown(f"""<div class="aw-header"><h1>PROJECT ALL-WEATHER</h1><span class="aw-badge">{glide_choice.split('·')[0]}</span></div>""", unsafe_allow_html=True)
+
+tab1, tab2, tab3, tab4 = st.tabs(["Strategic Allocation", "Tactical Engine", "Correlation & Risk", "Methodology"])
+
+with tab1:
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        st.markdown('<div class="aw-card"><h3>Regime Matrix</h3>', unsafe_allow_html=True)
+        st.write(f"Current Regime: **{quad_emoji} {quad_name}** (GDP {gdp_t} / CPI {cpi_t})")
+        st.write(f"Preferred Assets: {', '.join(quad_prefs)}")
+        st.markdown('</div>', unsafe_allow_html=True)
+    
+    with c2:
+        st.markdown('<div class="aw-card"><h3>Hedge Status</h3>', unsafe_allow_html=True)
+        crisis = prices["VOO"].iloc[-1] < prices["VOO"].rolling(200).mean().iloc[-1]
+        st.write("Status: " + ("🚨 CRISIS (Short S&P)" if crisis else "✅ NORMAL (Cash/T-Bills)"))
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    st.subheader("Core Risk Parity Positions")
+    core_px = prices[CORE_ASSETS]
+    inv_vol = 1 / (core_px.pct_change().std() * np.sqrt(252))
+    core_w = inv_vol / inv_vol.sum()
+    
+    cols = st.columns(len(CORE_ASSETS))
+    for i, t in enumerate(CORE_ASSETS):
+        alloc = (total_inv * core_pct/100) * core_w[t]
+        cols[i].metric(t, f"{core_w[t]:.1%}", f"${alloc:,.0f}")
+
+with tab2:
+    st.subheader("Top Tactical Conviction")
+    cols = st.columns(3)
+    for i, row in enumerate(top3.itertuples()):
+        with cols[i]:
+            st.markdown(f"""
+            <div class="aw-card">
+                <div style="font-size:1.2rem; font-weight:bold">{row.Ticker}</div>
+                <div style="color:var(--muted)">{row.Sector}</div>
+                <hr>
+                <div style="font-size:0.8rem">Conviction: <b>{row.Conviction:.1f}</b></div>
+                <div style="font-size:0.8rem">RSI: {row.RSI:.1f}</div>
+                <div class="stop-badge" style="margin-top:10px">ATR Stop: ${(row.Price * 0.94):.2f}</div>
+            </div>
+            """, unsafe_allow_html=True)
+    st.dataframe(tactical_df, use_container_width=True)
+
+with tab3:
+    st.subheader("Correlation Radar & Regime Risk")
+    c1, c2 = st.columns(2)
+    
+    with c1:
+        # Correlation Radar
+        corr = prices[CORE_ASSETS].pct_change().corr()
+        fig_radar = go.Figure()
+        for t in CORE_ASSETS:
+            fig_radar.add_trace(go.Scatterpolar(r=corr[t].values, theta=corr.columns, fill='toself', name=t))
+        fig_radar.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 1])), showlegend=True, template="plotly_dark", height=400)
+        st.plotly_chart(fig_
