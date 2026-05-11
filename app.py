@@ -13,15 +13,20 @@ warnings.filterwarnings('ignore')
 st.set_page_config(page_title="Project All-Weather", page_icon="🌦", layout="wide")
 
 # --- Optimized Data Fetching (Batching & Logic) ---
+import logging
+
 @st.cache_data(ttl=3600)
 def fetch_all_data(tickers):
-    """Batches all yfinance calls. Uses space-separated string for stability."""
+    """Batches all yfinance calls. Uses updated 2026 parameter syntax."""
     if not tickers: 
         return pd.DataFrame()
     
-    # CRITICAL FIX: Convert list to space-separated string
+    # Standardize ticker format
     ticker_str = " ".join(tickers) if isinstance(tickers, list) else tickers
     
+    # Suppress yfinance internal logger to act like 'silent=True'
+    logging.getLogger('yfinance').setLevel(logging.CRITICAL)
+
     try:
         data = yf.download(
             tickers=ticker_str, 
@@ -29,12 +34,11 @@ def fetch_all_data(tickers):
             interval="1d", 
             auto_adjust=True, 
             threads=True, 
-            group_by='ticker', # Keep this if your logic depends on it
-            silent=True
+            group_by='ticker',
+            progress=False  # <--- Use this instead of silent=True
         )
         return data
     except Exception as e:
-        # If it fails, return empty to prevent the app from crashing entirely
         st.error(f"Financial Data Error: {e}")
         return pd.DataFrame()
 
