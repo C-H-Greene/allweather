@@ -722,6 +722,12 @@ if not data_ok:
 sector_prices_for_sent = prices_all[[t for t in SECTOR_ETFS if t in prices_all.columns]]
 sentiment_data = compute_technical_sentiment(sector_prices_for_sent, volumes_all)
 
+# Read manual sector override early so ATR computation can cover those tickers
+_saved_raw    = st.query_params.get("manual_sectors", "")
+_all_sectors  = list(SECTOR_ETFS.keys())
+early_manual_sectors = [s for s in _saved_raw.split(",") if s in _all_sectors] \
+                       if _saved_raw else []
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PART 1 — CORE EQUITY (Age-Adjusted Risk Parity)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -805,7 +811,8 @@ def get_atrs(tickers, _prices: pd.DataFrame):
         result[t] = {"price": float(px), "atr": float(atr_val), "stop": stop}
     return result
 
-atr_data = get_atrs(tuple(top3), prices_all)
+atr_tickers = list(dict.fromkeys(top3 + early_manual_sectors))
+atr_data = get_atrs(tuple(atr_tickers), prices_all)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # REQUIRED SHARES CALCULATION
@@ -1234,6 +1241,120 @@ with tab3:
     </div>
     """, unsafe_allow_html=True)
 
+    # ── Sector override — load saved selection from localStorage ──────────
+    # JS: push any saved manual-sector selection from localStorage into URL params
+    all_sector_list = list(SECTOR_ETFS.keys())
+    st.components.v1.html("""
+    <script>
+    (function() {
+      const v = localStorage.getItem("aw_manual_sectors");
+      if (v !== null) {
+        const params = new URLSearchParams(window.parent.location.search);
+        if (params.get("manual_sectors") !== v) {
+          params.set("manual_sectors", v);
+          window.parent.history.replaceState(null, "", "?" + params.toString());
+        }
+      }
+    })();
+    </script>
+    """, height=0)
+
+    # Read saved manual sectors from query params
+    saved_sectors_raw = st.query_params.get("manual_sectors", "")
+    saved_sectors = [s for s in saved_sectors_raw.split(",") if s in all_sector_list] \
+                    if saved_sectors_raw else []
+    using_manual  = len(saved_sectors) > 0
+
+    # ── Sector override UI ────────────────────────────────────────────────
+    with st.expander(
+        f"⚙ Sector Override {'— ' + ', '.join(saved_sectors) + ' (manual)' if using_manual else '— using algo selection: ' + ', '.join(top3)}",
+        expanded=using_manual,
+    ):
+        st.markdown("""
+        <div style="font-size:0.78rem;color:var(--muted);margin-bottom:12px">
+          By default the drift report tracks the <b>3 algorithmically selected tactical sectors</b>.
+          Use the selector below to override with your actual holdings.
+          Select 1–5 sectors; target weight distributes evenly across your selection.
+          Save to persist — clear the selection to revert to algo mode.
+        </div>
+        """, unsafe_allow_html=True)
+
+        override_col, btn_col = st.columns([3, 1])
+        with override_col:
+            manual_sectors = st.multiselect(
+                "Select your tactical sectors",
+                options=all_sector_list,
+                default=saved_sectors if using_manual else [],
+                format_func=lambda t: f"{t} — {SECTOR_ETFS.get(t, t)}",
+                key="sector_override_select",
+                label_visibility="collapsed",
+            )
+        with btn_col:
+            save_sectors_btn = st.button("💾 Save sectors", key="save_sectors_btn",
+                                         use_container_width=True)
+            clear_btn        = st.button("✕ Revert to algo", key="clear_sectors_btn",
+                                         use_container_width=True)
+
+        if save_sectors_btn and manual_sectors:
+            joined = ",".join(manual_sectors)
+            st.query_params["manual_sectors"] = joined
+            st.components.v1.html(
+                f'<script>localStorage.setItem("aw_manual_sectors", "{joined}");</script>',
+                height=0,
+            )
+            saved_sectors  = manual_sectors
+            using_manual   = True
+            st.success(f"✓ Tracking: {', '.join(manual_sectors)}", icon="💾")
+
+        if clear_btn:
+            st.query_params.pop("manual_sectors", None)
+            st.components.v1.html(
+                '<script>localStorage.removeItem("aw_manual_sectors");</script>',
+                height=0,
+            )
+            saved_sectors = []
+            using_manual  = False
+            st.success("✓ Reverted to algo sector selection.", icon="↩")
+
+        # Show current vs algo for context
+        algo_col, manual_col = st.columns(2)
+        with algo_col:
+            st.markdown(
+                '<div style="font-family:var(--mono);font-size:0.65rem;color:var(--muted);'
+                'margin-top:8px">ALGO SELECTION (regime + momentum)</div>',
+                unsafe_allow_html=True,
+            )
+            for t in top3:
+                tag = " ✓ regime" if t in quad_preferred else " ↑ momentum"
+                st.markdown(
+                    f'<div style="font-family:var(--mono);font-size:0.75rem;'
+                    f'color:{"#10b981" if t in quad_preferred else "var(--accent3)"}">'
+                    f'{t} — {SECTOR_ETFS.get(t,"")}{tag}</div>',
+                    unsafe_allow_html=True,
+                )
+        with manual_col:
+            if using_manual:
+                st.markdown(
+                    '<div style="font-family:var(--mono);font-size:0.65rem;color:var(--muted);'
+                    'margin-top:8px">YOUR MANUAL SELECTION (active)</div>',
+                    unsafe_allow_html=True,
+                )
+                for t in saved_sectors:
+                    tag = " ✓ regime" if t in quad_preferred else (
+                          " ⚠ anti-regime" if t in anti_preferred else "")
+                    color = "#10b981" if t in quad_preferred else (
+                            "#ef4444" if t in anti_preferred else "var(--text)")
+                    st.markdown(
+                        f'<div style="font-family:var(--mono);font-size:0.75rem;color:{color}">'
+                        f'{t} — {SECTOR_ETFS.get(t,"")}{tag}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+    # Determine active tactical tickers for the drift table
+    active_tactical = saved_sectors if using_manual else top3
+    # Distribute tactical % evenly across however many sectors selected
+    tactical_per_active = tactical_alloc_pct / max(len(active_tactical), 1)
+
     # ── Build target rows ──────────────────────────────────────────────────
     target_rows = []
     for ticker in CORE_ASSETS:
@@ -1246,12 +1367,12 @@ with tab3:
             "Label":    CORE_LABELS.get(ticker, ticker),
             "Target %": round(core_bucket * w * 100, 2),
         })
-    for ticker in top3:
+    for ticker in active_tactical:
         target_rows.append({
             "Ticker":   ticker,
-            "Bucket":   "Tactical",
+            "Bucket":   "Tactical" + (" ✏" if using_manual else ""),
             "Label":    SECTOR_ETFS.get(ticker, ticker),
-            "Target %": round(tactical_per_sector * 100, 2),
+            "Target %": round(tactical_per_active * 100, 2),
         })
     target_rows.append({
         "Ticker":   hedge_ticker,
@@ -1263,8 +1384,14 @@ with tab3:
     target_df     = pd.DataFrame(target_rows)
     drift_tickers = target_df["Ticker"].tolist()
 
-    # ── JS: load both current % AND cost basis from localStorage → URL params ─
-    holdings_js_keys = ", ".join(f'"{t}"' for t in drift_tickers)
+    # ── JS: load current %, cost basis, shares for ALL possible tickers ───
+    # Use the full universe so saved values survive manual sector switches
+    all_possible_drift = list(dict.fromkeys(
+        [t for t in CORE_ASSETS] +
+        all_sector_list +
+        [hedge_ticker]
+    ))
+    holdings_js_keys = ", ".join(f'"{t}"' for t in all_possible_drift)
     st.components.v1.html(f"""
     <script>
     (function() {{
