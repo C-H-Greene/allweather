@@ -15,20 +15,28 @@ st.set_page_config(page_title="Project All-Weather", page_icon="🌦", layout="w
 # --- Optimized Data Fetching (Batching & Logic) ---
 @st.cache_data(ttl=3600)
 def fetch_all_data(tickers):
-    """Batches all yfinance calls into a single download for speed."""
-    if not tickers: return pd.DataFrame()
-    # Download 2 years to ensure 200d SMA and ATR calculations are stable
-    data = yf.download(tickers, period="2y", interval="1d", group_by='ticker', silent=True)
-    return data
-
-def get_ticker_close(data, ticker):
-    """Helper to safely extract closing prices from grouped yfinance data."""
+    """Batches all yfinance calls. Uses space-separated string for stability."""
+    if not tickers: 
+        return pd.DataFrame()
+    
+    # CRITICAL FIX: Convert list to space-separated string
+    ticker_str = " ".join(tickers) if isinstance(tickers, list) else tickers
+    
     try:
-        if len(data.columns.levels) > 1:
-            return data[ticker]['Close']
-        return data['Close']
-    except:
-        return pd.Series()
+        data = yf.download(
+            tickers=ticker_str, 
+            period="2y", 
+            interval="1d", 
+            auto_adjust=True, 
+            threads=True, 
+            group_by='ticker', # Keep this if your logic depends on it
+            silent=True
+        )
+        return data
+    except Exception as e:
+        # If it fails, return empty to prevent the app from crashing entirely
+        st.error(f"Financial Data Error: {e}")
+        return pd.DataFrame()
 
 # --- New Feature: Correlations Radar ---
 def plot_correlation_matrix(data, tickers):
