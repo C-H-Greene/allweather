@@ -748,6 +748,11 @@ CORE_LABELS = {
 quad_key  = (gdp_trend, cpi_trend)
 quad_name, quad_emoji, quad_preferred = QUADRANT_MAP.get(quad_key, ("Unknown","❓",[]))
 
+# Opposite regime: flip both GDP and CPI trends
+_flip = {"rising": "falling", "falling": "rising"}
+anti_quad_key  = (_flip[gdp_trend], _flip[cpi_trend])
+anti_quad_name, anti_quad_emoji, anti_preferred = QUADRANT_MAP.get(anti_quad_key, ("Unknown","❓",[]))
+
 sector_prices = prices_all[[t for t in SECTOR_ETFS if t in prices_all.columns]]
 three_mo_ago  = sector_prices.index[-1] - timedelta(days=90)
 start_prices  = sector_prices[sector_prices.index >= three_mo_ago].iloc[0]
@@ -1109,18 +1114,18 @@ with tab2:
     st.markdown('<div class="aw-card-title">📈 S&P 500 Sector Momentum — 3M Return · Volume · Put/Call</div>', unsafe_allow_html=True)
 
     # Column header
-    st.markdown("""
+    st.markdown(f"""
     <div style="display:flex;align-items:center;gap:16px;padding:6px 0 10px;
                 border-bottom:1px solid var(--border);
                 font-family:var(--mono);font-size:0.6rem;color:var(--muted);
                 letter-spacing:1px;text-transform:uppercase">
       <div style="width:48px">ETF</div>
-      <div style="flex:1">Sector</div>
+      <div style="flex:1">Sector · Current: {quad_emoji} {quad_name} / Opposite: {anti_quad_emoji} {anti_quad_name}</div>
       <div style="width:130px">3M Return</div>
       <div style="width:68px;text-align:right">3M Ret</div>
       <div style="width:76px;text-align:right">Rel Vol</div>
       <div style="width:62px;text-align:right">P/C Ratio</div>
-      <div style="width:150px;text-align:right">Badges</div>
+      <div style="width:190px;text-align:right">Badges</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1130,6 +1135,7 @@ with tab2:
         bar_c    = "#10b981" if ret >= 0 else "#ef4444"
         is_sel   = ticker in top3
         is_reg   = ticker in quad_preferred
+        is_anti  = ticker in anti_preferred and not is_reg  # mutually exclusive
 
         # ── Volume: relative volume (5d avg / 20d avg) ────────────────────
         if ticker in volumes_all.columns and len(volumes_all[ticker].dropna()) >= 20:
@@ -1145,25 +1151,18 @@ with tab2:
         pcr = pcr_data.get(ticker)
         if pcr is not None:
             pcr_str   = f"{pcr:.2f}"
-            # >1.0 = more puts = bearish sentiment; <0.7 = more calls = bullish
             pcr_color = "#ef4444" if pcr > 1.0 else ("#10b981" if pcr < 0.7 else "var(--muted)")
             pcr_label = "bearish" if pcr > 1.0 else ("bullish" if pcr < 0.7 else "neutral")
         else:
             pcr_str = "—"; pcr_color = "var(--muted)"; pcr_label = ""
 
-        sel_badge = ('<span style="background:#3b82f6;color:white;padding:2px 6px;'
-                     'border-radius:3px;font-size:0.6rem;font-family:var(--mono)">SELECTED</span>'
-                     ) if is_sel else ""
-        ra_badge  = ('<span style="background:rgba(167,139,250,0.2);color:#a78bfa;padding:2px 6px;'
-                     'border-radius:3px;font-size:0.6rem;font-family:var(--mono);'
-                     'border:1px solid rgba(167,139,250,0.3)">REGIME</span>'
-                     ) if is_reg else ""
-
+        # ── Data row (no badge HTML — avoids f-string escaping) ───────────
+        ticker_color = "var(--text)" if is_sel else "var(--muted)"
         st.markdown(f"""
-        <div style="display:flex;align-items:center;gap:16px;padding:10px 0;
-                    border-bottom:1px solid var(--border)">
+        <div style="display:flex;align-items:center;gap:16px;padding:10px 0 4px;
+                    border-bottom:{'none' if (is_sel or is_reg or is_anti) else '1px solid var(--border)'}">
           <div style="font-family:var(--mono);font-weight:700;width:48px;
-                      color:{'var(--text)' if is_sel else 'var(--muted)'}">{ticker}</div>
+                      color:{ticker_color}">{ticker}</div>
           <div style="flex:1;font-size:0.78rem;color:var(--muted)">{SECTOR_ETFS.get(ticker, ticker)}</div>
           <div style="width:130px">
             <div style="height:5px;background:var(--surface2);border-radius:2px;overflow:hidden">
@@ -1180,21 +1179,45 @@ with tab2:
             <span style="color:{pcr_color}">{pcr_str}</span>
             <span style="font-size:0.6rem;color:var(--muted);display:block">{pcr_label}</span>
           </div>
-          <div style="width:150px;display:flex;gap:5px;justify-content:flex-end;flex-wrap:wrap">
-            {sel_badge}{ra_badge}
-          </div>
+          <div style="width:190px"></div>
         </div>
         """, unsafe_allow_html=True)
 
-    st.markdown("""
+        # ── Badges — separate call so inline styles aren't escaped ────────
+        if is_sel or is_reg or is_anti:
+            sel_badge  = (
+                '<span style="background:#3b82f6;color:white;padding:2px 6px;'
+                'border-radius:3px;font-size:0.6rem;font-family:var(--mono)">SELECTED</span>'
+            ) if is_sel else ""
+            reg_badge  = (
+                '<span style="background:rgba(167,139,250,0.2);color:#a78bfa;padding:2px 6px;'
+                'border-radius:3px;font-size:0.6rem;font-family:var(--mono);'
+                'border:1px solid rgba(167,139,250,0.3)">REGIME</span>'
+            ) if is_reg else ""
+            anti_badge = (
+                f'<span style="background:rgba(239,68,68,0.12);color:#ef4444;padding:2px 6px;'
+                f'border-radius:3px;font-size:0.6rem;font-family:var(--mono);'
+                f'border:1px solid rgba(239,68,68,0.3)" '
+                f'title="Preferred in {anti_quad_emoji} {anti_quad_name} — the opposite of current {quad_emoji} {quad_name}">'
+                f'ANTI-REGIME</span>'
+            ) if is_anti else ""
+            st.markdown(
+                f'<div style="display:flex;gap:5px;justify-content:flex-end;'
+                f'padding:3px 0 10px;border-bottom:1px solid var(--border)">'
+                f'{sel_badge}{reg_badge}{anti_badge}</div>',
+                unsafe_allow_html=True
+            )
+
+    st.markdown(f"""
     <div style="margin-top:12px;padding:10px 14px;background:var(--surface2);
                 border:1px solid var(--border);border-radius:6px;
                 font-size:0.7rem;color:var(--muted);font-family:var(--mono)">
       <b style="color:var(--text)">Rel Vol</b> = 5d avg ÷ 20d avg volume.
       &gt;1.15× = above-average participation · &lt;0.85× = low conviction.
       &nbsp;&nbsp;<b style="color:var(--text)">P/C</b> = put/call volume ratio (nearest 2 expirations).
-      &gt;1.0 = net bearish positioning · &lt;0.7 = net bullish.
-      "—" = options data unavailable.
+      &gt;1.0 = net bearish · &lt;0.7 = net bullish. "—" = unavailable.
+      &nbsp;&nbsp;<b style="color:#a78bfa">REGIME</b> = preferred in current {quad_emoji} {quad_name}.
+      &nbsp;&nbsp;<b style="color:#ef4444">ANTI-REGIME</b> = preferred in opposite {anti_quad_emoji} {anti_quad_name} — headwind to current macro.
     </div>
     """, unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
@@ -1300,7 +1323,7 @@ with tab3:
                 "Current % ✏️", min_value=0.0, max_value=100.0, step=0.1, format="%.1f"),
             "Shares":     st.column_config.NumberColumn(
                 "Shares ✏️", min_value=0.0, step=0.01, format="%.2f",
-                help="Number of shares you currently hold"),
+                help="Shares held — fractional shares supported to 2 decimal places"),
             "Cost Basis": st.column_config.NumberColumn(
                 "Cost Basis ✏️", min_value=0.0, step=0.01, format="$%.2f",
                 help="Average cost per share (used for P&L and stop-loss monitoring)"),
@@ -1422,27 +1445,9 @@ with tab3:
         stopped = row["Stopped"]
 
         has_cb = cb > 0 and px > 0
-        pnl_html = ""
-        if has_cb:
-            pnl_color  = "#10b981" if (pnl_d or 0) >= 0 else "#ef4444"
-            stop_color = "#ef4444" if stopped else "var(--muted)"
-            stop_badge = ('<span style="background:rgba(239,68,68,0.15);color:#ef4444;'
-                          'font-family:var(--mono);font-size:0.6rem;padding:1px 6px;'
-                          'border-radius:3px;border:1px solid rgba(239,68,68,0.3)">'
-                          '🚨 STOPPED</span> ') if stopped else ""
-            pnl_html = f"""
-            <div style="margin-top:8px;padding:8px 10px;background:rgba(255,255,255,0.03);
-                        border-radius:4px;display:flex;gap:16px;flex-wrap:wrap;
-                        font-family:var(--mono);font-size:0.7rem">
-              {stop_badge}
-              <span>Cost: <b>${cb:.2f}</b></span>
-              <span>Price: <b style="color:{'#10b981' if px >= cb else '#ef4444'}">${px:.2f}</b></span>
-              <span>P&L: <b style="color:{pnl_color}">${pnl_d:,.0f} ({pnl_pct:+.1f}%)</b></span>
-              <span style="color:{stop_color}">Stop: ${stop:.2f}</span>
-            </div>"""
 
         st.markdown(f"""
-        <div style="padding:14px 0;border-bottom:1px solid var(--border)">
+        <div style="padding:14px 0 6px;border-bottom:{'none' if has_cb else '1px solid var(--border)'}">
           <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
             <b style="font-family:var(--mono);width:50px">{row['Ticker']}</b>
             <span style="font-size:0.68rem;color:{bucket_color};font-family:var(--mono);
@@ -1468,9 +1473,32 @@ with tab3:
             </div>
             <span style="width:38px;text-align:right">{row['Current %']:.1f}%</span>
           </div>
-          {pnl_html}
         </div>
         """, unsafe_allow_html=True)
+
+        # P&L strip rendered as a SEPARATE st.markdown call so it isn't escaped
+        # by the outer f-string context — nested HTML in f-strings gets sanitised.
+        if has_cb:
+            pnl_color  = "#10b981" if (pnl_d or 0) >= 0 else "#ef4444"
+            stop_color = "#ef4444" if stopped else "var(--muted)"
+            px_color   = "#10b981" if px >= cb else "#ef4444"
+            stop_badge = (
+                '<span style="background:rgba(239,68,68,0.15);color:#ef4444;'
+                'font-family:var(--mono);font-size:0.6rem;padding:1px 6px;'
+                'border-radius:3px;border:1px solid rgba(239,68,68,0.3)">🚨 STOPPED</span>'
+            ) if stopped else ""
+            st.markdown(f"""
+            <div style="padding:6px 10px 14px;border-bottom:1px solid var(--border);
+                        display:flex;gap:16px;flex-wrap:wrap;align-items:center;
+                        font-family:var(--mono);font-size:0.7rem;
+                        background:rgba(255,255,255,0.02);border-radius:0 0 4px 4px">
+              {stop_badge}
+              <span style="color:var(--muted)">Cost: <b style="color:var(--text)">${cb:.2f}</b></span>
+              <span style="color:var(--muted)">Price: <b style="color:{px_color}">${px:.2f}</b></span>
+              <span style="color:var(--muted)">P&amp;L: <b style="color:{pnl_color}">${pnl_d:,.0f} ({pnl_pct:+.1f}%)</b></span>
+              <span style="color:{stop_color}">Stop: ${stop:.2f}</span>
+            </div>
+            """, unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     # ── Summary footer ─────────────────────────────────────────────────────
@@ -1542,37 +1570,37 @@ with tab4:
         eq_w     = len(equity_a) / n * 100
         bond_w   = len(bond_a)   / n * 100
         alt_w    = len(alt_a)    / n * 100
-
-        current_badge = (
-            f'<span style="background:{border_col};color:white;font-family:var(--mono);'
-            f'font-size:0.6rem;padding:2px 8px;border-radius:3px;'
-            f'letter-spacing:1px;margin-left:10px">CURRENT</span>'
-        ) if is_current else ""
-
         label_color = "var(--text)" if is_current else "var(--muted)"
+        assets_str  = "→".join(assets)
 
+        # ── Card open + header row ─────────────────────────────────────────
         st.markdown(f"""
-        <div style="padding:18px 20px;background:{bg};border:1px solid {border};
-                    border-radius:8px;margin-bottom:12px">
+        <div style="padding:18px 20px 10px;background:{bg};border:1px solid {border};
+                    border-radius:8px 8px 0 0;margin-bottom:0">
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
-            <div>
+            <div style="display:flex;align-items:center;gap:8px">
               <b style="font-family:var(--mono);font-size:0.85rem;color:{label_color}">{stage}</b>
-              {current_badge}
+              {"" if not is_current else f'<span style="background:{border_col};color:white;font-family:var(--mono);font-size:0.6rem;padding:2px 8px;border-radius:3px;letter-spacing:1px">CURRENT</span>'}
             </div>
-            <div style="font-size:0.75rem;color:var(--muted)">
-              {'→'.join(assets)}
-            </div>
+            <div style="font-size:0.75rem;color:var(--muted)">{assets_str}</div>
           </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── Bar + legend row — separate call so ■ color spans render cleanly ─
+        st.markdown(f"""
+        <div style="padding:0 20px 16px;background:{bg};border:1px solid {border};
+                    border-top:none;border-radius:0 0 8px 8px;margin-bottom:12px">
           <div style="height:10px;border-radius:5px;overflow:hidden;display:flex;margin-bottom:10px">
             <div style="width:{eq_w:.1f}%;background:#10b981"></div>
             <div style="width:{bond_w:.1f}%;background:#3b82f6"></div>
             <div style="width:{alt_w:.1f}%;background:#f59e0b"></div>
           </div>
-          <div style="display:flex;gap:16px;font-size:0.7rem;color:var(--muted);font-family:var(--mono)">
+          <div style="display:flex;gap:16px;font-size:0.7rem;color:var(--muted);font-family:var(--mono);flex-wrap:wrap">
             <span><span style="color:#10b981">■</span> Equity {eq_w:.0f}%</span>
             <span><span style="color:#3b82f6">■</span> Bonds {bond_w:.0f}%</span>
             <span><span style="color:#f59e0b">■</span> Alts {alt_w:.0f}%</span>
-            <span style="margin-left:auto;font-style:italic">{cfg['description']}</span>
+            <span style="margin-left:auto;font-style:italic;color:var(--muted)">{cfg['description']}</span>
           </div>
         </div>
         """, unsafe_allow_html=True)
