@@ -1299,7 +1299,7 @@ with tab3:
             "Current %":  st.column_config.NumberColumn(
                 "Current % ✏️", min_value=0.0, max_value=100.0, step=0.1, format="%.1f"),
             "Shares":     st.column_config.NumberColumn(
-                "Shares ✏️", min_value=0.0, step=1.0, format="%.0f",
+                "Shares ✏️", min_value=0.0, step=0.01, format="%.2f",
                 help="Number of shares you currently hold"),
             "Cost Basis": st.column_config.NumberColumn(
                 "Cost Basis ✏️", min_value=0.0, step=0.01, format="$%.2f",
