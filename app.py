@@ -1476,29 +1476,33 @@ with tab3:
         </div>
         """, unsafe_allow_html=True)
 
-        # P&L strip rendered as a SEPARATE st.markdown call so it isn't escaped
-        # by the outer f-string context — nested HTML in f-strings gets sanitised.
+        # P&L strip — built entirely via Python string concat, NOT f-string interpolation
+        # of HTML fragments. Any variable containing HTML tags must not be injected via {}.
         if has_cb:
             pnl_color  = "#10b981" if (pnl_d or 0) >= 0 else "#ef4444"
             stop_color = "#ef4444" if stopped else "var(--muted)"
             px_color   = "#10b981" if px >= cb else "#ef4444"
-            stop_badge = (
-                '<span style="background:rgba(239,68,68,0.15);color:#ef4444;'
-                'font-family:var(--mono);font-size:0.6rem;padding:1px 6px;'
-                'border-radius:3px;border:1px solid rgba(239,68,68,0.3)">🚨 STOPPED</span>'
-            ) if stopped else ""
-            st.markdown(f"""
-            <div style="padding:6px 10px 14px;border-bottom:1px solid var(--border);
-                        display:flex;gap:16px;flex-wrap:wrap;align-items:center;
-                        font-family:var(--mono);font-size:0.7rem;
-                        background:rgba(255,255,255,0.02);border-radius:0 0 4px 4px">
-              {stop_badge}
-              <span style="color:var(--muted)">Cost: <b style="color:var(--text)">${cb:.2f}</b></span>
-              <span style="color:var(--muted)">Price: <b style="color:{px_color}">${px:.2f}</b></span>
-              <span style="color:var(--muted)">P&amp;L: <b style="color:{pnl_color}">${pnl_d:,.0f} ({pnl_pct:+.1f}%)</b></span>
-              <span style="color:{stop_color}">Stop: ${stop:.2f}</span>
-            </div>
-            """, unsafe_allow_html=True)
+
+            parts = [
+                '<div style="padding:6px 10px 14px;border-bottom:1px solid var(--border);'
+                'display:flex;gap:16px;flex-wrap:wrap;align-items:center;'
+                'font-family:var(--mono);font-size:0.7rem;'
+                'background:rgba(255,255,255,0.02);border-radius:0 0 4px 4px">',
+            ]
+            if stopped:
+                parts.append(
+                    '<span style="background:rgba(239,68,68,0.15);color:#ef4444;'
+                    'font-family:var(--mono);font-size:0.6rem;padding:1px 6px;'
+                    'border-radius:3px;border:1px solid rgba(239,68,68,0.3)">🚨 STOPPED</span>'
+                )
+            parts += [
+                f'<span style="color:var(--muted)">Cost: <b style="color:var(--text)">${cb:.2f}</b></span>',
+                f'<span style="color:var(--muted)">Price: <b style="color:{px_color}">${px:.2f}</b></span>',
+                f'<span style="color:var(--muted)">P&amp;L: <b style="color:{pnl_color}">${pnl_d:,.0f} ({pnl_pct:+.1f}%)</b></span>',
+                f'<span style="color:{stop_color}">Stop: ${stop:.2f}</span>',
+                '</div>',
+            ]
+            st.markdown("".join(parts), unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     # ── Summary footer ─────────────────────────────────────────────────────
