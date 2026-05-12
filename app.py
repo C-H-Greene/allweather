@@ -379,45 +379,59 @@ def _make_demo_prices(tickers, n=260):
     return pd.DataFrame(result, index=dates)
 
 @st.cache_data(ttl=3600)
-def fetch_price_data(tickers: list, period: str = "1y") -> pd.DataFrame:
+def fetch_ohlcv(tickers: tuple, period: str = "1y") -> tuple:
+    """
+    Single yf.download call returning (close_df, volume_df).
+    Replaces separate fetch_price_data + fetch_volume_data calls.
+    tickers is a tuple for st.cache_data hashability.
+    """
     try:
-        data = yf.download(tickers, period=period, auto_adjust=True, progress=False)
+        data = yf.download(list(tickers), period=period, auto_adjust=True, progress=False)
         if isinstance(data.columns, pd.MultiIndex):
-            df = data["Close"]
+            close_df  = data["Close"]
+            volume_df = data["Volume"]
+            high_df   = data["High"]
+            low_df    = data["Low"]
         else:
-            df = data[["Close"]].rename(columns={"Close": tickers[0]})
-        if df.empty or df.isnull().all().all():
+            t = list(tickers)[0]
+            close_df  = data[["Close"]].rename(columns={"Close": t})
+            volume_df = data[["Volume"]].rename(columns={"Volume": t})
+            high_df   = data[["High"]].rename(columns={"High": t})
+            low_df    = data[["Low"]].rename(columns={"Low": t})
+
+        if close_df.empty or close_df.isnull().all().all():
             raise ValueError("Empty response")
-        return df
+
+        return close_df.ffill(), volume_df.ffill(), high_df.ffill(), low_df.ffill()
+
     except Exception:
         st.warning("⚠ Live market data unavailable — running in **Demo Mode** with synthetic prices. "
                    "Deploy locally or on Streamlit Cloud to enable real-time data.", icon="🔌")
-        return _make_demo_prices(tickers)
-
-@st.cache_data(ttl=3600)
-def fetch_volume_data(tickers: list, period: str = "3mo") -> pd.DataFrame:
-    """Fetch daily volume for tickers. Returns DataFrame of volumes."""
-    try:
-        data = yf.download(tickers, period=period, auto_adjust=True, progress=False)
-        if isinstance(data.columns, pd.MultiIndex):
-            vol = data["Volume"]
-        else:
-            vol = data[["Volume"]].rename(columns={"Volume": tickers[0]})
-        if vol.empty or vol.isnull().all().all():
-            raise ValueError("Empty volume")
-        return vol.ffill()
-    except Exception:
-        # Synthetic demo volume
+        prices = _make_demo_prices(list(tickers))
         np.random.seed(99)
-        dates = pd.bdate_range(end=datetime.today(), periods=65)
-        result = {}
-        for t in tickers:
-            base = 20_000_000
-            result[t] = (np.random.lognormal(0, 0.3, len(dates)) * base).astype(int)
-        return pd.DataFrame(result, index=dates)
+        dates  = prices.index
+        vols   = pd.DataFrame(
+            {t: (np.random.lognormal(0, 0.3, len(dates)) * 20_000_000).astype(int)
+             for t in tickers},
+            index=dates,
+        )
+        # Synthetic high/low from close ±0.5%
+        highs = prices * 1.005
+        lows  = prices * 0.995
+        return prices, vols, highs, lows
+
+# Keep fetch_price_data as a thin wrapper for any remaining call sites
+def fetch_price_data(tickers: list, period: str = "1y") -> pd.DataFrame:
+    close, _, _, _ = fetch_ohlcv(tuple(tickers), period)
+    return close
+
+def fetch_volume_data(tickers: list, period: str = "3mo") -> pd.DataFrame:
+    _, vol, _, _ = fetch_ohlcv(tuple(tickers), period)
+    return vol
+
 
 @st.cache_data(ttl=3600)
-def fetch_options_pcr(tickers: list) -> dict:
+def fetch_options_pcr(tickers: tuple) -> dict:
     """
     Fetch Put/Call volume ratio for each ticker using yfinance options chains.
     Uses the nearest 2 expiration dates to get a liquid cross-section.
@@ -520,11 +534,11 @@ def compute_technical_sentiment(prices: pd.DataFrame, volumes: pd.DataFrame) -> 
             sma_score = max(-1.0, min(1.0, sma_score))
 
             # ── Volume trend (5d vs 20d avg) ──────────────────────────────
+            vol_ratio = 1.0  # default — avoids reference-before-assignment
             if len(vol) >= 20:
-                vol_5d   = vol.tail(5).mean()
-                vol_20d  = vol.tail(20).mean()
+                vol_5d    = vol.tail(5).mean()
+                vol_20d   = vol.tail(20).mean()
                 vol_ratio = float(vol_5d / vol_20d) if vol_20d > 0 else 1.0
-                # Rising volume amplifies price direction; use sma_score as direction
                 vol_mod   = (vol_ratio - 1.0) * np.sign(sma_score)
                 vol_score = max(-1.0, min(1.0, vol_mod))
             else:
@@ -571,18 +585,24 @@ def compute_volatility_weights(prices: pd.DataFrame) -> pd.Series:
     inv_vol = 1 / vols
     return inv_vol / inv_vol.sum()
 
-def compute_atr(prices: pd.DataFrame, ticker: str, window: int = 14) -> float:
+def compute_atr(ticker: str, highs: pd.DataFrame, lows: pd.DataFrame,
+                closes: pd.DataFrame, window: int = 14) -> float:
+    """Compute ATR from already-fetched OHLCV data — no extra network call."""
     try:
-        raw = yf.download(ticker, period="3mo", auto_adjust=True, progress=False)
-        if raw.empty:
+        if ticker not in highs.columns:
             return 0.0
-        hi = raw["High"].squeeze()
-        lo = raw["Low"].squeeze()
-        cl = raw["Close"].squeeze()
-        tr = pd.concat([hi - lo,
-                        (hi - cl.shift()).abs(),
-                        (lo - cl.shift()).abs()], axis=1).max(axis=1)
-        return tr.rolling(window).mean().iloc[-1]
+        hi = highs[ticker].dropna()
+        lo = lows[ticker].dropna()
+        cl = closes[ticker].dropna()
+        if len(hi) < window + 1:
+            return 0.0
+        tr = pd.concat([
+            hi - lo,
+            (hi - cl.shift()).abs(),
+            (lo - cl.shift()).abs(),
+        ], axis=1).max(axis=1)
+        val = tr.rolling(window).mean().iloc[-1]
+        return float(val) if pd.notna(val) else 0.0
     except Exception:
         return 0.0
 
@@ -626,10 +646,16 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("##### Bucket Weights")
 
-    core_pct     = st.slider("Core Equity %",        40, 80, _core_pct_default,     5)
-    tactical_pct = st.slider("Tactical Pure Alpha %", 10, 40, _tactical_pct_default, 5)
-    hedge_pct    = 100 - core_pct - tactical_pct
-    st.markdown(f"Hedge (auto) **{hedge_pct}%**")
+    core_pct     = st.slider("Core Equity %",        40, 80,
+                              max(40, min(80, _core_pct_default     - _core_pct_default     % 5)), 5)
+    tactical_pct = st.slider("Tactical Pure Alpha %", 10, 40,
+                              max(10, min(40, _tactical_pct_default - _tactical_pct_default % 5)), 5)
+    hedge_pct    = max(0, 100 - core_pct - tactical_pct)
+    _over = core_pct + tactical_pct > 100
+    if _over:
+        st.warning(f"⚠ Core + Tactical = {core_pct + tactical_pct}% (over 100%). Hedge set to 0%.", icon="⚠")
+    else:
+        st.markdown(f"Hedge (auto) **{hedge_pct}%**")
     st.markdown("---")
 
     # ── Save to localStorage ───────────────────────────────────────────────
@@ -698,20 +724,22 @@ with st.spinner("Fetching market data…"):
     all_tickers = list(dict.fromkeys(all_tickers))
 
     try:
-        prices_all = fetch_price_data(all_tickers, period="1y")
-        available   = [t for t in all_tickers if t in prices_all.columns]
-        prices_all  = prices_all[available].ffill()
-        data_ok     = True
+        _close, _volume, _high, _low = fetch_ohlcv(tuple(all_tickers), period="1y")
+        available    = [t for t in all_tickers if t in _close.columns]
+        prices_all   = _close[available]
+        highs_all    = _high[[t for t in available if t in _high.columns]]
+        lows_all     = _low[[t for t in available if t in _low.columns]]
+        volumes_all  = _volume[[t for t in available if t in _volume.columns]]
+        data_ok      = True
     except Exception as e:
         st.error(f"Data fetch failed: {e}")
         data_ok = False
 
-    # Volume data — 3 months is sufficient for 5d/20d averages
+    # Volume for sector ETFs is already in volumes_all from the unified fetch above
     sector_tickers_list = list(SECTOR_ETFS.keys())
-    volumes_all = fetch_volume_data(sector_tickers_list, period="3mo")
 
-    # Put/Call ratios for sector ETFs
-    pcr_data = fetch_options_pcr(sector_tickers_list)
+    # Put/Call ratios — separate call since options chains aren't in OHLCV
+    pcr_data = fetch_options_pcr(tuple(sector_tickers_list))
 
     gdp_trend, cpi_trend, gdp_vals, cpi_vals = fetch_fred_macro()
 
@@ -801,18 +829,18 @@ hedge_bucket = hedge_pct / 100
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=3600)
-def get_atrs(tickers, _prices: pd.DataFrame):
-    """_prices prefixed with _ so st.cache_data skips hashing the DataFrame."""
+def get_atrs(tickers: tuple, _prices: pd.DataFrame,
+             _highs: pd.DataFrame, _lows: pd.DataFrame) -> dict:
+    """_-prefixed args skip st.cache_data hashing (DataFrames aren't hashable)."""
     result = {}
     for t in tickers:
-        px      = _prices[t].iloc[-1] if t in _prices.columns else 0
-        atr_val = compute_atr(_prices, t)
-        stop    = float(px) - 2 * float(atr_val)
-        result[t] = {"price": float(px), "atr": float(atr_val), "stop": stop}
+        px      = float(_prices[t].iloc[-1]) if t in _prices.columns else 0.0
+        atr_val = compute_atr(t, _highs, _lows, _prices)
+        result[t] = {"price": px, "atr": atr_val, "stop": px - 2 * atr_val}
     return result
 
-atr_tickers = list(dict.fromkeys(top3 + early_manual_sectors))
-atr_data = get_atrs(tuple(atr_tickers), prices_all)
+atr_tickers = tuple(dict.fromkeys(top3 + early_manual_sectors))
+atr_data = get_atrs(atr_tickers, prices_all, highs_all, lows_all)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # REQUIRED SHARES CALCULATION
@@ -983,7 +1011,7 @@ with tab1:
         </div>
         """, unsafe_allow_html=True)
 
-        rows = []
+        rows = []  # kept for potential future export feature
         for i, ticker in enumerate(CORE_ASSETS):
             if ticker not in core_weights.index:
                 continue
@@ -1016,9 +1044,6 @@ with tab1:
               </div>
             </div>
             """, unsafe_allow_html=True)
-            rows.append({"Ticker": ticker, "Weight": f"{w*100:.1f}%",
-                         "$ Alloc": f"${dollar:,.0f}", "Shares": shares,
-                         "Price": f"${px:.2f}", "30d Vol": f"{vol*100:.1f}%"})
         st.markdown('</div>', unsafe_allow_html=True)
 
     with c2:
