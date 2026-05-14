@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import math
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
@@ -462,38 +463,149 @@ def fetch_options_pcr(tickers: tuple) -> dict:
 
 @st.cache_data(ttl=3600)
 def fetch_fred_macro():
-    """Pull GDP and CPI trend from FRED via direct HTTP (no API key required for these series)."""
-    import urllib.request, json
-    
-    def fred_series(series_id):
+    """
+    Pull GDP and CPI from FRED. Returns trend, raw values, momentum magnitude,
+    and consecutive-period streak — all used by the regime confidence engine.
+    """
+    import urllib.request
+
+    def fred_series(series_id, tail=12):
         url = (f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
                f"&vintage_date={datetime.today().strftime('%Y-%m-%d')}")
         try:
             with urllib.request.urlopen(url, timeout=8) as r:
                 lines = r.read().decode().strip().split('\n')
-            rows = [l.split(',') for l in lines[1:] if '.' in l]
+            rows  = [l.split(',') for l in lines[1:] if '.' in l]
             dates = [r[0] for r in rows]
             vals  = [float(r[1]) for r in rows]
-            return pd.Series(vals, index=pd.to_datetime(dates)).dropna().tail(8)
+            return pd.Series(vals, index=pd.to_datetime(dates)).dropna().tail(tail)
         except Exception:
             return None
 
-    gdp = fred_series("GDP")
-    cpi = fred_series("CPIAUCSL")
+    gdp = fred_series("GDP",      tail=12)
+    cpi = fred_series("CPIAUCSL", tail=12)
 
-    gdp_trend = "rising"   # safe defaults (expansion is more common baseline)
+    gdp_trend = "rising"
     cpi_trend = "falling"
-    gdp_vals  = cpi_vals  = []
+    gdp_vals  = cpi_vals = []
 
+    # ── GDP ───────────────────────────────────────────────────────────────
+    gdp_mom    = 0.0   # % change, last period
+    gdp_streak = 1     # consecutive quarters in current direction
     if gdp is not None and len(gdp) >= 2:
-        gdp_trend = "rising" if gdp.iloc[-1] > gdp.iloc[-2] else "falling"
-        gdp_vals  = gdp.tolist()
-    if cpi is not None and len(cpi) >= 2:
-        lookback = min(5, len(cpi) - 1)
-        cpi_trend = "rising" if cpi.iloc[-1] > cpi.iloc[-lookback] else "falling"
-        cpi_vals  = cpi.tolist()
+        gdp_trend  = "rising" if gdp.iloc[-1] > gdp.iloc[-2] else "falling"
+        gdp_vals   = gdp.tolist()
+        gdp_mom    = float((gdp.iloc[-1] - gdp.iloc[-2]) / gdp.iloc[-2] * 100)
+        # Count how many consecutive periods match current trend
+        direction  = np.sign(gdp.diff().dropna())
+        current_d  = direction.iloc[-1]
+        streak = 1
+        for d in reversed(direction.iloc[:-1].tolist()):
+            if np.sign(d) == current_d:
+                streak += 1
+            else:
+                break
+        gdp_streak = streak
 
-    return gdp_trend, cpi_trend, gdp_vals, cpi_vals
+    # ── CPI ───────────────────────────────────────────────────────────────
+    cpi_mom    = 0.0
+    cpi_streak = 1
+    if cpi is not None and len(cpi) >= 2:
+        lookback   = min(5, len(cpi) - 1)
+        cpi_trend  = "rising" if cpi.iloc[-1] > cpi.iloc[-lookback] else "falling"
+        cpi_vals   = cpi.tolist()
+        cpi_mom    = float((cpi.iloc[-1] - cpi.iloc[-lookback]) / cpi.iloc[-lookback] * 100)
+        direction  = np.sign(cpi.diff().dropna())
+        current_d  = direction.iloc[-1]
+        streak = 1
+        for d in reversed(direction.iloc[:-1].tolist()):
+            if np.sign(d) == current_d:
+                streak += 1
+            else:
+                break
+        cpi_streak = streak
+
+    return (gdp_trend, cpi_trend, gdp_vals, cpi_vals,
+            gdp_mom, cpi_mom, gdp_streak, cpi_streak)
+
+@st.cache_data(ttl=3600)
+def fetch_sector_pe(tickers: tuple) -> tuple:
+    """
+    Fetch forward P/E for each sector ETF via yfinance .info.
+    Falls back to historically-calibrated estimates when data is unavailable
+    (e.g. in network-restricted environments or when yfinance returns null).
+
+    Returns (results_dict, spy_fwd_pe):
+        results_dict[ticker] = {
+            "fwd_pe":    float | None,   # forward 12-month P/E
+            "rel_pe":    float | None,   # fwd_pe / SPY_fwd_pe (>1 = premium)
+            "source":    "live" | "estimate" | "unavailable",
+            "valuation": "expensive" | "fair" | "cheap" | "unknown",
+            "spy_pe":    float,
+        }
+    """
+    # Historically-calibrated sector forward P/E estimates (2024-2025 baseline)
+    PE_ESTIMATES: dict = {
+        "XLK":  29.5, "XLC":  20.8, "XLY":  24.1,
+        "XLF":  15.2, "XLI":  21.3, "XLV":  18.4,
+        "XLB":  19.6, "XLRE": 36.2, "XLE":  12.8,
+        "XLP":  20.1, "XLU":  17.9,
+    }
+    SPY_PE_ESTIMATE = 21.5
+
+    spy_fwd_pe = SPY_PE_ESTIMATE
+    live_pes   = {}
+
+    # Attempt live fetch — works on Streamlit Cloud, blocked in sandbox
+    try:
+        spy_info    = yf.Ticker("SPY").info
+        spy_live_pe = spy_info.get("forwardPE") or spy_info.get("trailingPE")
+        if spy_live_pe and 10 < float(spy_live_pe) < 60:
+            spy_fwd_pe = float(spy_live_pe)
+    except Exception:
+        pass
+
+    for ticker in tickers:
+        try:
+            info   = yf.Ticker(ticker).info
+            fwd_pe = info.get("forwardPE")
+            if fwd_pe and 5 < float(fwd_pe) < 100:
+                live_pes[ticker] = float(fwd_pe)
+        except Exception:
+            pass
+
+    results = {}
+    for ticker in tickers:
+        if ticker in live_pes:
+            fwd_pe = live_pes[ticker]
+            source = "live"
+        elif ticker in PE_ESTIMATES:
+            fwd_pe = PE_ESTIMATES[ticker]
+            source = "estimate"
+        else:
+            results[ticker] = {
+                "fwd_pe": None, "rel_pe": None,
+                "source": "unavailable", "valuation": "unknown",
+                "spy_pe": round(spy_fwd_pe, 1),
+            }
+            continue
+
+        rel_pe = round(fwd_pe / spy_fwd_pe, 2)
+        valuation = (
+            "expensive" if rel_pe > 1.25 else
+            "cheap"     if rel_pe < 0.80 else
+            "fair"
+        )
+        results[ticker] = {
+            "fwd_pe":   round(fwd_pe, 1),
+            "rel_pe":   rel_pe,
+            "source":   source,
+            "valuation": valuation,
+            "spy_pe":   round(spy_fwd_pe, 1),
+        }
+
+    return results, round(spy_fwd_pe, 1)
+
 
 # ── Technical sentiment proxy — replaces unreliable external APIs ─────────────
 # GDELT and all RSS sources return 403 from cloud/datacenter IPs (Streamlit Cloud
@@ -741,7 +853,11 @@ with st.spinner("Fetching market data…"):
     # Put/Call ratios — separate call since options chains aren't in OHLCV
     pcr_data = fetch_options_pcr(tuple(sector_tickers_list))
 
-    gdp_trend, cpi_trend, gdp_vals, cpi_vals = fetch_fred_macro()
+    # Forward P/E for all sector ETFs
+    pe_data, spy_pe = fetch_sector_pe(tuple(sector_tickers_list))
+
+    gdp_trend, cpi_trend, gdp_vals, cpi_vals, \
+    gdp_mom, cpi_mom, gdp_streak, cpi_streak = fetch_fred_macro()
 
 if not data_ok:
     st.stop()
@@ -791,19 +907,165 @@ sector_prices = prices_all[[t for t in SECTOR_ETFS if t in prices_all.columns]]
 three_mo_ago  = sector_prices.index[-1] - timedelta(days=90)
 start_prices  = sector_prices[sector_prices.index >= three_mo_ago].iloc[0]
 end_prices    = sector_prices.iloc[-1]
-sector_returns= ((end_prices - start_prices) / start_prices).sort_values(ascending=False)
+sector_returns = ((end_prices - start_prices) / start_prices).sort_values(ascending=False)
 
-# Prefer quadrant-aligned; fill remainder with momentum leaders
-preferred_available = [t for t in quad_preferred if t in sector_returns.index]
-top_momentum        = [t for t in sector_returns.index if t not in preferred_available]
+# ── Valuation-adjusted momentum score ────────────────────────────────────────
+# Pure momentum can chase overvalued sectors. We apply a modest P/E adjustment:
+#   cheap  (rel P/E < 0.80): +2% bonus to return score
+#   fair   (rel P/E 0.80–1.25): no adjustment
+#   expensive (rel P/E > 1.25): -3% penalty to return score
+#
+# The asymmetry (penalty > bonus) reflects that overvaluation is a clearer
+# headwind than undervaluation is a tailwind in short rotation cycles.
+
+def pe_adj_return(ticker: str, raw_return: float) -> float:
+    pe = pe_data.get(ticker, {})
+    valuation = pe.get("valuation", "fair")
+    if valuation == "cheap":
+        return raw_return + 0.02
+    elif valuation == "expensive":
+        return raw_return - 0.03
+    return raw_return
+
+sector_returns_adj = pd.Series(
+    {t: pe_adj_return(t, float(sector_returns[t])) for t in sector_returns.index},
+    name="adj_return"
+).sort_values(ascending=False)
+
+# Prefer quadrant-aligned; fill remainder with valuation-adjusted momentum leaders
+preferred_available = [t for t in quad_preferred if t in sector_returns_adj.index]
+top_momentum        = [t for t in sector_returns_adj.index if t not in preferred_available]
 top3 = (preferred_available + top_momentum)[:3]
 
 tactical_alloc_pct  = tactical_pct / 100
 tactical_per_sector = tactical_alloc_pct / 3
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PART 3 — TAIL RISK HEDGE
+# REGIME CONFIDENCE ENGINE
+# Blends 4 independent signals into a 0–100 confidence score.
+#
+# Signal 1 — Macro momentum magnitude (25%)
+#   How strongly is GDP/CPI moving, not just direction.
+#   Normalised against typical quarterly ranges.
+#
+# Signal 2 — Streak / trend age (25%)
+#   Consecutive periods the regime has been in place.
+#   Long streaks = established; very long = possibly mature/transitioning.
+#
+# Signal 3 — Sector confirmation rate (30%)
+#   What % of the regime's preferred sectors are outperforming SPY 3M.
+#   High agreement between price action and macro label = high confidence.
+#
+# Signal 4 — Equity-bond decorrelation (20%)
+#   Risk parity works when equities and bonds are uncorrelated or negatively
+#   correlated. Positive correlation = regime instability / stress.
 # ══════════════════════════════════════════════════════════════════════════════
+
+def compute_regime_confidence(
+    gdp_mom: float, cpi_mom: float,
+    gdp_streak: int, cpi_streak: int,
+    quad_preferred: list, sector_returns: pd.Series,
+    prices_all: pd.DataFrame,
+) -> dict:
+
+    # ── Signal 1: Macro momentum magnitude ───────────────────────────────
+    # Typical quarterly GDP move ~0.5–1.5%, CPI move ~0.2–0.8%
+    # Scale to 0–1 using expected max magnitudes
+    gdp_mag   = min(abs(gdp_mom) / 2.0, 1.0)   # 2% = full confidence
+    cpi_mag   = min(abs(cpi_mom) / 1.5, 1.0)   # 1.5% = full confidence
+    macro_sig = (gdp_mag + cpi_mag) / 2.0
+
+    # ── Signal 2: Streak / trend age ─────────────────────────────────────
+    # 1 period = just turned, low confidence
+    # 4+ periods = well established; 8+ = potentially late-cycle
+    min_streak = min(gdp_streak, cpi_streak)   # both axes must agree
+    if min_streak <= 1:
+        streak_sig = 0.25
+    elif min_streak <= 3:
+        streak_sig = 0.60
+    elif min_streak <= 6:
+        streak_sig = 0.85
+    else:
+        # Very long streak — may be mature/late; confidence plateaus then fades
+        streak_sig = max(0.60, 0.85 - (min_streak - 6) * 0.05)
+
+    # ── Signal 3: Sector price confirmation ──────────────────────────────
+    spy_3m = 0.0
+    if "VOO" in sector_returns.index:
+        spy_3m = float(sector_returns["VOO"])
+    elif "SPY" in sector_returns.index:
+        spy_3m = float(sector_returns["SPY"])
+
+    if quad_preferred:
+        beats = sum(
+            1 for t in quad_preferred
+            if t in sector_returns.index and float(sector_returns[t]) > spy_3m
+        )
+        sector_sig = beats / len(quad_preferred)
+    else:
+        sector_sig = 0.5
+
+    # ── Signal 4: Equity-bond decorrelation ──────────────────────────────
+    decorr_sig = 0.5   # neutral default
+    if "VOO" in prices_all.columns and "TLT" in prices_all.columns:
+        eq_ret   = prices_all["VOO"].pct_change().dropna().tail(60)
+        bond_ret = prices_all["TLT"].pct_change().dropna().tail(60)
+        if len(eq_ret) >= 20 and len(bond_ret) >= 20:
+            combined = pd.concat([eq_ret, bond_ret], axis=1).dropna()
+            if len(combined) >= 20:
+                corr = float(combined.iloc[:, 0].corr(combined.iloc[:, 1]))
+                # Negative corr = ideal (1.0), zero corr = neutral (0.5),
+                # positive corr = stress (0.0)
+                decorr_sig = max(0.0, min(1.0, (1.0 - corr) / 2.0))
+
+    # ── Blend ─────────────────────────────────────────────────────────────
+    score = (
+        0.25 * macro_sig   +
+        0.25 * streak_sig  +
+        0.30 * sector_sig  +
+        0.20 * decorr_sig
+    )
+    score_pct = round(score * 100)
+
+    # ── Stability label ───────────────────────────────────────────────────
+    if score_pct >= 75:
+        label, color, desc = "ESTABLISHED", "#10b981", "Signals strongly aligned. High conviction."
+    elif score_pct >= 55:
+        label, color, desc = "CONFIRMED",   "#3b82f6", "Regime confirmed across most signals."
+    elif score_pct >= 35:
+        label, color, desc = "FORMING",     "#f59e0b", "Early signals present. Monitor for confirmation."
+    else:
+        label, color, desc = "TRANSITIONING", "#ef4444", "Weak or conflicting signals. Regime may be shifting."
+
+    # Streak label for display
+    if min_streak <= 1:
+        streak_label = "New signal"
+    elif min_streak <= 3:
+        streak_label = f"{min_streak} periods"
+    else:
+        streak_label = f"{min_streak} periods" + (" — late cycle" if min_streak > 6 else "")
+
+    return {
+        "score":        score_pct,
+        "label":        label,
+        "color":        color,
+        "desc":         desc,
+        "macro_sig":    round(macro_sig * 100),
+        "streak_sig":   round(streak_sig * 100),
+        "sector_sig":   round(sector_sig * 100),
+        "decorr_sig":   round(decorr_sig * 100),
+        "streak_label": streak_label,
+        "gdp_mom":      round(gdp_mom, 3),
+        "cpi_mom":      round(cpi_mom, 3),
+        "corr_used":    round(1.0 - decorr_sig * 2.0, 3),   # back-compute for display
+    }
+
+regime_confidence = compute_regime_confidence(
+    gdp_mom, cpi_mom, gdp_streak, cpi_streak,
+    quad_preferred, sector_returns, prices_all,
+)
+
+
 
 voo_prices = prices_all["VOO"] if "VOO" in prices_all.columns else None
 crisis_mode= False
@@ -870,7 +1132,7 @@ with col_regime:
         ("falling","rising"): ("Recession","❄️"),
         ("falling","falling"):("Deflation","🌧"),
     }
-    
+
     grid_html = """
     <div style="margin-bottom:8px">
       <div style="text-align:center;font-family:var(--mono);font-size:0.6rem;
@@ -918,7 +1180,101 @@ with col_regime:
       Regime: <b style="color:var(--accent)">{quad_emoji} {quad_name.upper()}</b>
     </div>
     """, unsafe_allow_html=True)
+
+    # ── Regime Confidence Gauge ───────────────────────────────────────────
+    rc   = regime_confidence
+    score = rc["score"]
+    color = rc["color"]
+
+    # SVG arc gauge — computed from score
+    # Arc runs from 210° to 330° (240° sweep) — standard semi-gauge shape
+    sweep   = 240
+    start_a = 210
+    end_a   = start_a + sweep * (score / 100)
+    r, cx, cy = 52, 70, 68
+
+    # Track arc (background)
+    def p(deg, rad=r):
+        a = math.radians(deg)
+        return f"{cx + rad * math.cos(a):.1f},{cy + rad * math.sin(a):.1f}"
+
+    # Large arc flag: 1 if sweep > 180
+    fill_sweep = sweep * score / 100
+    large_fill = 1 if fill_sweep > 180 else 0
+    large_track = 1  # full track is 240° > 180°
+
+    track_path = (f"M {p(start_a)} "
+                  f"A {r} {r} 0 {large_track} 1 {p(start_a + sweep)}")
+    fill_path  = (f"M {p(start_a)} "
+                  f"A {r} {r} 0 {large_fill} 1 {p(start_a + fill_sweep)}"
+                  if fill_sweep > 0 else "")
+
+    # Tick marks at 25/50/75
+    ticks_svg = ""
+    for pct, tick_label in [(0,""), (25,""), (50,""), (75,""), (100,"")]:
+        ta = start_a + sweep * pct / 100
+        x1, y1 = cx + (r-6)*math.cos(math.radians(ta)), cy + (r-6)*math.sin(math.radians(ta))
+        x2, y2 = cx + (r+2)*math.cos(math.radians(ta)), cy + (r+2)*math.sin(math.radians(ta))
+        ticks_svg += f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="#1e2535" stroke-width="2"/>'
+
+    gauge_svg = f"""
+    <svg viewBox="0 0 140 90" xmlns="http://www.w3.org/2000/svg" style="width:160px;margin:8px auto;display:block">
+      <path d="{track_path}" fill="none" stroke="#1e2535" stroke-width="10" stroke-linecap="round"/>
+      {"" if not fill_path else f'<path d="{fill_path}" fill="none" stroke="{color}" stroke-width="10" stroke-linecap="round" opacity="0.9"/>'}
+      {ticks_svg}
+      <text x="{cx}" y="{cy - 4}" text-anchor="middle" font-family="Space Mono,monospace"
+            font-size="18" font-weight="700" fill="{color}">{score}</text>
+      <text x="{cx}" y="{cy + 12}" text-anchor="middle" font-family="Space Mono,monospace"
+            font-size="6" fill="#64748b" letter-spacing="1">CONFIDENCE</text>
+      <text x="{cx}" y="{cy + 22}" text-anchor="middle" font-family="Space Mono,monospace"
+            font-size="7" font-weight="700" fill="{color}" letter-spacing="1">{rc["label"]}</text>
+    </svg>
+    """
+    st.markdown(gauge_svg, unsafe_allow_html=True)
+
+    # Signal breakdown bars — 4 sub-scores
+    signals = [
+        ("Macro Momentum",   rc["macro_sig"],  f"GDP {rc['gdp_mom']:+.2f}% · CPI {rc['cpi_mom']:+.2f}%"),
+        ("Trend Streak",     rc["streak_sig"], rc["streak_label"]),
+        ("Sector Confirm",   rc["sector_sig"], f"{rc['sector_sig']}% of preferred sectors beating SPY"),
+        ("EQ/Bond Decorr",   rc["decorr_sig"], f"60d corr: {rc['corr_used']:+.2f}"),
+    ]
+
+    parts = ['<div style="margin-top:4px">']
+    for sig_name, sig_val, sig_detail in signals:
+        w    = sig_val
+        scol = "#10b981" if w >= 70 else ("#f59e0b" if w >= 40 else "#ef4444")
+        parts += [
+            '<div style="margin-bottom:7px">',
+            '<div style="display:flex;justify-content:space-between;'
+            'font-family:var(--mono);font-size:0.62rem;color:var(--muted);margin-bottom:3px">',
+            f'<span>{sig_name}</span><span style="color:{scol}">{w}</span>',
+            '</div>',
+            '<div style="height:4px;background:var(--surface2);border-radius:2px">',
+            f'<div style="height:100%;width:{w}%;background:{scol};border-radius:2px"></div>',
+            '</div>',
+            f'<div style="font-size:0.6rem;color:var(--muted);margin-top:2px">{sig_detail}</div>',
+            '</div>',
+        ]
+    parts.append('</div>')
+    st.markdown("".join(parts), unsafe_allow_html=True)
+
+    # Regime summary pill
+    st.markdown(
+        f'<div style="margin-top:10px;padding:8px 12px;background:rgba(59,130,246,0.08);'
+        f'border:1px solid rgba(59,130,246,0.2);border-radius:6px;'
+        f'font-family:var(--mono);font-size:0.72rem">'
+        f'GDP: <b style="color:{"#10b981" if gdp_trend=="rising" else "#ef4444"}">{gdp_trend.upper()}</b>'
+        f'&nbsp;&nbsp;|&nbsp;&nbsp;'
+        f'CPI: <b style="color:{"#ef4444" if cpi_trend=="rising" else "#10b981"}">{cpi_trend.upper()}</b>'
+        f'&nbsp;&nbsp;|&nbsp;&nbsp;'
+        f'Regime: <b style="color:var(--accent)">{quad_emoji} {quad_name.upper()}</b>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
     st.markdown('</div>', unsafe_allow_html=True)
+
+
 
 with col_hedge_info:
     st.markdown('<div class="aw-card">', unsafe_allow_html=True)
@@ -1056,24 +1412,56 @@ with tab1:
         """, unsafe_allow_html=True)
 
         for ticker in top3:
-            dollar = total_inv * tactical_per_sector
+            dollar    = total_inv * tactical_per_sector
             shares, px = calc_shares(ticker, dollar)
-            ret    = sector_returns[ticker] if ticker in sector_returns.index else 0.0
-            atr_info = atr_data.get(ticker, {"atr": 0, "stop": 0, "price": px})
-            aligned  = "✓ regime" if ticker in quad_preferred else "↑ momentum"
+            ret       = sector_returns[ticker] if ticker in sector_returns.index else 0.0
+            ret_adj   = float(sector_returns_adj[ticker]) if ticker in sector_returns_adj.index else ret
+            atr_info  = atr_data.get(ticker, {"atr": 0, "stop": 0, "price": px})
+            aligned   = "✓ regime" if ticker in quad_preferred else "↑ momentum"
             ret_color = "#10b981" if ret >= 0 else "#ef4444"
 
+            # P/E data for this ticker
+            pe     = pe_data.get(ticker, {})
+            fwd_pe = pe.get("fwd_pe")
+            rel_pe = pe.get("rel_pe")
+            val    = pe.get("valuation", "fair")
+            pe_src = pe.get("source", "estimate")
+            pe_color = (
+                "#ef4444" if val == "expensive" else
+                "#10b981" if val == "cheap"     else
+                "var(--muted)"
+            )
+            pe_adj_delta = ret_adj - ret
+            pe_badge_parts = []
+            if fwd_pe is not None:
+                pe_badge_parts.append(
+                    f'<span style="background:rgba(255,255,255,0.05);'
+                    f'border:1px solid {pe_color}44;color:{pe_color};'
+                    f'font-family:var(--mono);font-size:0.62rem;padding:2px 7px;border-radius:3px">'
+                    f'P/E {fwd_pe:.1f}x · {val}</span>'
+                )
+            if abs(pe_adj_delta) > 0.001:
+                adj_c = "#10b981" if pe_adj_delta > 0 else "#ef4444"
+                adj_txt = f'{"+" if pe_adj_delta > 0 else ""}{pe_adj_delta*100:.1f}% P/E adj'
+                pe_badge_parts.append(
+                    f'<span style="font-family:var(--mono);font-size:0.6rem;color:{adj_c}">'
+                    f'{adj_txt}</span>'
+                )
+
+            # Build card — metric tiles stay in f-string (no HTML vars),
+            # P/E badges emitted in a separate st.markdown call below
             st.markdown(f"""
             <div style="padding:14px;background:var(--surface2);border:1px solid var(--border);
-                        border-radius:6px;margin-bottom:12px">
+                        border-radius:6px 6px 0 0;margin-bottom:0">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
                 <div>
                   <b style="font-family:var(--mono);font-size:1rem">{ticker}</b>
                   <span style="font-size:0.75rem;color:var(--muted);margin-left:8px">{SECTOR_ETFS.get(ticker,'')}</span>
                 </div>
-                <span style="font-family:var(--mono);color:{ret_color};font-size:0.9rem">
-                  {ret*100:+.1f}%
-                </span>
+                <div style="text-align:right">
+                  <span style="font-family:var(--mono);color:{ret_color};font-size:0.9rem">{ret*100:+.1f}%</span>
+                  <span style="font-family:var(--mono);font-size:0.65rem;color:var(--muted);display:block">3M raw</span>
+                </div>
               </div>
               <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
                 <div class="metric-tile" style="padding:8px 12px;min-width:80px">
@@ -1091,15 +1479,31 @@ with tab1:
               </div>
               <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
                 <span class="stop-badge">🛑 Stop ${atr_info['stop']:.2f}</span>
-                <span style="font-size:0.7rem;color:var(--muted)">
-                  2×ATR (${atr_info['atr']:.2f})
-                </span>
+                <span style="font-size:0.7rem;color:var(--muted)">2×ATR (${atr_info['atr']:.2f})</span>
                 <span style="margin-left:auto;font-size:0.65rem;
                              color:{'var(--accent)' if aligned=='✓ regime' else 'var(--accent3)'};
                              font-family:var(--mono)">{aligned}</span>
               </div>
             </div>
             """, unsafe_allow_html=True)
+
+            # P/E badges — separate call to avoid HTML escaping
+            if pe_badge_parts:
+                badge_html = (
+                    '<div style="padding:6px 14px 10px;background:var(--surface2);'
+                    'border:1px solid var(--border);border-top:none;border-radius:0 0 6px 6px;'
+                    'display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">'
+                    + "".join(pe_badge_parts)
+                    + '</div>'
+                )
+                st.markdown(badge_html, unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    '<div style="height:12px;background:var(--surface2);'
+                    'border:1px solid var(--border);border-top:none;'
+                    'border-radius:0 0 6px 6px;margin-bottom:12px"></div>',
+                    unsafe_allow_html=True,
+                )
 
         st.markdown(f"""
         <div style="padding:12px 14px;background:rgba(245,158,11,0.08);
@@ -1143,33 +1547,42 @@ with tab1:
 # ─── TAB 2 — SECTOR MOMENTUM ─────────────────────────────────────────────────
 with tab2:
     st.markdown('<div class="aw-card">', unsafe_allow_html=True)
-    st.markdown('<div class="aw-card-title">📈 S&P 500 Sector Momentum — 3M Return · Volume · Put/Call</div>', unsafe_allow_html=True)
+    st.markdown('<div class="aw-card-title">📈 S&P 500 Sector Momentum — 3M Return · Vol · P/C · Fwd P/E</div>', unsafe_allow_html=True)
+
+    # P/E source indicator
+    live_count = sum(1 for v in pe_data.values() if v.get("source") == "live")
+    pe_source_label = f"{'Live' if live_count > 0 else 'Estimated'} P/E data ({live_count}/{len(pe_data)} live · SPY {spy_pe:.1f}x)"
+    pe_source_color = "#10b981" if live_count > 0 else "#f59e0b"
 
     # Column header
     st.markdown(f"""
-    <div style="display:flex;align-items:center;gap:16px;padding:6px 0 10px;
+    <div style="display:flex;align-items:center;gap:12px;padding:6px 0 10px;
                 border-bottom:1px solid var(--border);
                 font-family:var(--mono);font-size:0.6rem;color:var(--muted);
                 letter-spacing:1px;text-transform:uppercase">
       <div style="width:48px">ETF</div>
       <div style="flex:1">Sector · Current: {quad_emoji} {quad_name} / Opposite: {anti_quad_emoji} {anti_quad_name}</div>
-      <div style="width:130px">3M Return</div>
-      <div style="width:68px;text-align:right">3M Ret</div>
-      <div style="width:76px;text-align:right">Rel Vol</div>
-      <div style="width:62px;text-align:right">P/C Ratio</div>
+      <div style="width:110px">3M Return</div>
+      <div style="width:60px;text-align:right">3M Ret</div>
+      <div style="width:68px;text-align:right">Rel Vol</div>
+      <div style="width:54px;text-align:right">P/C</div>
+      <div style="width:80px;text-align:right">
+        <span style="color:{pe_source_color}">Fwd P/E</span>
+      </div>
       <div style="width:190px;text-align:right">Badges</div>
     </div>
     """, unsafe_allow_html=True)
 
-    for ticker in sector_returns.index:
+    for ticker in sector_returns_adj.index:
         ret      = sector_returns[ticker] if ticker in sector_returns.index else 0.0
+        ret_adj  = float(sector_returns_adj[ticker])
         bar_w    = min(abs(ret) * 200, 100)
         bar_c    = "#10b981" if ret >= 0 else "#ef4444"
         is_sel   = ticker in top3
         is_reg   = ticker in quad_preferred
-        is_anti  = ticker in anti_preferred and not is_reg  # mutually exclusive
+        is_anti  = ticker in anti_preferred and not is_reg
 
-        # ── Volume: relative volume (5d avg / 20d avg) ────────────────────
+        # ── Volume ────────────────────────────────────────────────────────
         if ticker in volumes_all.columns and len(volumes_all[ticker].dropna()) >= 20:
             v   = volumes_all[ticker].dropna()
             rv  = float(v.tail(5).mean() / v.tail(20).mean())
@@ -1184,32 +1597,62 @@ with tab2:
         if pcr is not None:
             pcr_str   = f"{pcr:.2f}"
             pcr_color = "#ef4444" if pcr > 1.0 else ("#10b981" if pcr < 0.7 else "var(--muted)")
-            pcr_label = "bearish" if pcr > 1.0 else ("bullish" if pcr < 0.7 else "neutral")
+            pcr_label = "bear" if pcr > 1.0 else ("bull" if pcr < 0.7 else "neut")
         else:
             pcr_str = "—"; pcr_color = "var(--muted)"; pcr_label = ""
 
-        # ── Data row (no badge HTML — avoids f-string escaping) ───────────
+        # ── Forward P/E ───────────────────────────────────────────────────
+        pe     = pe_data.get(ticker, {})
+        fwd_pe = pe.get("fwd_pe")
+        rel_pe = pe.get("rel_pe")
+        val    = pe.get("valuation", "fair")
+        pe_src = pe.get("source", "estimate")
+
+        if fwd_pe is not None:
+            pe_str    = f"{fwd_pe:.1f}x"
+            rel_str   = f"{rel_pe:+.0%}".replace("+0%", "inline").replace("-", "−") if rel_pe else ""
+            pe_color  = (
+                "#ef4444" if val == "expensive" else
+                "#10b981" if val == "cheap" else
+                "var(--muted)"
+            )
+            pe_label  = val
+        else:
+            pe_str = "—"; pe_color = "var(--muted)"; pe_label = ""; rel_str = ""
+
+        # Show P/E adjustment indicator if it changed the adj score
+        pe_adj_delta = ret_adj - ret
+        adj_indicator = ""
+        if abs(pe_adj_delta) > 0.001:
+            adj_color = "#10b981" if pe_adj_delta > 0 else "#ef4444"
+            adj_indicator = f'<span style="font-size:0.58rem;color:{adj_color}">{"▲" if pe_adj_delta > 0 else "▼"} adj</span>'
+
+        # ── Data row ──────────────────────────────────────────────────────
         ticker_color = "var(--text)" if is_sel else "var(--muted)"
         st.markdown(f"""
-        <div style="display:flex;align-items:center;gap:16px;padding:10px 0 4px;
+        <div style="display:flex;align-items:center;gap:12px;padding:10px 0 4px;
                     border-bottom:{'none' if (is_sel or is_reg or is_anti) else '1px solid var(--border)'}">
           <div style="font-family:var(--mono);font-weight:700;width:48px;
                       color:{ticker_color}">{ticker}</div>
           <div style="flex:1;font-size:0.78rem;color:var(--muted)">{SECTOR_ETFS.get(ticker, ticker)}</div>
-          <div style="width:130px">
+          <div style="width:110px">
             <div style="height:5px;background:var(--surface2);border-radius:2px;overflow:hidden">
               <div style="height:100%;width:{bar_w:.0f}%;background:{bar_c};border-radius:2px"></div>
             </div>
           </div>
-          <div style="font-family:var(--mono);font-size:0.82rem;width:68px;text-align:right;
+          <div style="font-family:var(--mono);font-size:0.8rem;width:60px;text-align:right;
                       color:{bar_c}">{ret*100:+.1f}%</div>
-          <div style="font-family:var(--mono);font-size:0.78rem;width:76px;text-align:right">
+          <div style="font-family:var(--mono);font-size:0.76rem;width:68px;text-align:right">
             <span style="color:{rv_color}">{rv_str}</span>
-            <span style="font-size:0.6rem;color:var(--muted);display:block">{rv_label}</span>
+            <span style="font-size:0.58rem;color:var(--muted);display:block">{rv_label}</span>
           </div>
-          <div style="font-family:var(--mono);font-size:0.78rem;width:62px;text-align:right">
+          <div style="font-family:var(--mono);font-size:0.76rem;width:54px;text-align:right">
             <span style="color:{pcr_color}">{pcr_str}</span>
-            <span style="font-size:0.6rem;color:var(--muted);display:block">{pcr_label}</span>
+            <span style="font-size:0.58rem;color:var(--muted);display:block">{pcr_label}</span>
+          </div>
+          <div style="font-family:var(--mono);font-size:0.76rem;width:80px;text-align:right">
+            <span style="color:{pe_color}">{pe_str}</span>
+            <span style="font-size:0.58rem;color:{pe_color};display:block">{pe_label} {adj_indicator}</span>
           </div>
           <div style="width:190px"></div>
         </div>
@@ -1246,10 +1689,15 @@ with tab2:
                 font-size:0.7rem;color:var(--muted);font-family:var(--mono)">
       <b style="color:var(--text)">Rel Vol</b> = 5d avg ÷ 20d avg volume.
       &gt;1.15× = above-average participation · &lt;0.85× = low conviction.
-      &nbsp;&nbsp;<b style="color:var(--text)">P/C</b> = put/call volume ratio (nearest 2 expirations).
-      &gt;1.0 = net bearish · &lt;0.7 = net bullish. "—" = unavailable.
+      &nbsp;&nbsp;<b style="color:var(--text)">P/C</b> = put/call volume ratio.
+      &gt;1.0 = net bearish · &lt;0.7 = net bullish.
+      &nbsp;&nbsp;<b style="color:var(--text)">Fwd P/E</b> = forward 12-month P/E vs SPY {spy_pe:.1f}x.
+      <span style="color:#10b981">cheap</span> = &lt;0.80× SPY ·
+      <span style="color:#ef4444">expensive</span> = &gt;1.25× SPY.
+      P/E adjusts momentum score: cheap +2% · expensive −3%.
+      &nbsp;&nbsp;<span style="color:{pe_source_color}">{pe_source_label}</span>
       &nbsp;&nbsp;<b style="color:#a78bfa">REGIME</b> = preferred in current {quad_emoji} {quad_name}.
-      &nbsp;&nbsp;<b style="color:#ef4444">ANTI-REGIME</b> = preferred in opposite {anti_quad_emoji} {anti_quad_name} — headwind to current macro.
+      &nbsp;&nbsp;<b style="color:#ef4444">ANTI-REGIME</b> = preferred in opposite {anti_quad_emoji} {anti_quad_name}.
     </div>
     """, unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
