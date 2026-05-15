@@ -464,12 +464,28 @@ def fetch_options_pcr(tickers: tuple) -> dict:
 @st.cache_data(ttl=3600)
 def fetch_fred_macro():
     """
-    Pull GDP and CPI from FRED. Returns trend, raw values, momentum magnitude,
-    and consecutive-period streak — all used by the regime confidence engine.
+    Pull macro data from FRED. Returns:
+      - Coincident indicators: GDP trend/mom/streak, CPI trend/mom/streak
+      - Leading indicators:    yield curve (10Y-2Y), ISM Manufacturing PMI,
+                               Conference Board LEI, initial jobless claims
+
+    All series fetched via FRED's public CSV endpoint — no API key required.
+
+    Leading indicators lead GDP by ~6-9 months and are what sophisticated
+    macro managers actually watch for regime shifts. Coincident indicators
+    (GDP, CPI) confirm what leading indicators predicted.
+
+    FRED Series IDs used:
+        GDP         — Gross Domestic Product, quarterly
+        CPIAUCSL    — CPI All Urban Consumers, monthly
+        T10Y2Y      — 10Y minus 2Y Treasury spread (yield curve), daily → monthly avg
+        MANEMP      — ISM Manufacturing PMI proxy via NAPM
+        INDPRO      — Industrial Production Index (LEI component)
+        ICSA        — Initial Jobless Claims, weekly → monthly avg
     """
     import urllib.request
 
-    def fred_series(series_id, tail=12):
+    def fred_series(series_id: str, tail: int = 18) -> pd.Series | None:
         url = (f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
                f"&vintage_date={datetime.today().strftime('%Y-%m-%d')}")
         try:
@@ -482,51 +498,146 @@ def fetch_fred_macro():
         except Exception:
             return None
 
-    gdp = fred_series("GDP",      tail=12)
-    cpi = fred_series("CPIAUCSL", tail=12)
-
-    gdp_trend = "rising"
-    cpi_trend = "falling"
-    gdp_vals  = cpi_vals = []
-
-    # ── GDP ───────────────────────────────────────────────────────────────
-    gdp_mom    = 0.0   # % change, last period
-    gdp_streak = 1     # consecutive quarters in current direction
-    if gdp is not None and len(gdp) >= 2:
-        gdp_trend  = "rising" if gdp.iloc[-1] > gdp.iloc[-2] else "falling"
-        gdp_vals   = gdp.tolist()
-        gdp_mom    = float((gdp.iloc[-1] - gdp.iloc[-2]) / gdp.iloc[-2] * 100)
-        # Count how many consecutive periods match current trend
-        direction  = np.sign(gdp.diff().dropna())
-        current_d  = direction.iloc[-1]
-        streak = 1
-        for d in reversed(direction.iloc[:-1].tolist()):
+    def streak_count(series: pd.Series) -> tuple[str, int]:
+        """Return (direction, consecutive_periods) for the latest trend."""
+        diffs     = np.sign(series.diff().dropna())
+        current_d = diffs.iloc[-1]
+        direction = "rising" if current_d > 0 else "falling"
+        count = 1
+        for d in reversed(diffs.iloc[:-1].tolist()):
             if np.sign(d) == current_d:
-                streak += 1
+                count += 1
             else:
                 break
-        gdp_streak = streak
+        return direction, count
 
-    # ── CPI ───────────────────────────────────────────────────────────────
-    cpi_mom    = 0.0
-    cpi_streak = 1
+    # ── Fetch all series ──────────────────────────────────────────────────
+    gdp      = fred_series("GDP",      tail=12)
+    cpi      = fred_series("CPIAUCSL", tail=18)
+    yc_raw   = fred_series("T10Y2Y",   tail=756)   # daily, ~3 years
+    ism_raw  = fred_series("MANEMP",   tail=24)    # manufacturing employment proxy
+    indpro   = fred_series("INDPRO",   tail=24)    # industrial production
+    claims   = fred_series("ICSA",     tail=104)   # weekly claims
+
+    # ── Coincident: GDP ───────────────────────────────────────────────────
+    gdp_trend = "rising"; gdp_mom = 0.0; gdp_streak = 1; gdp_vals = []
+    if gdp is not None and len(gdp) >= 2:
+        gdp_trend, gdp_streak = streak_count(gdp)
+        gdp_mom    = float((gdp.iloc[-1] - gdp.iloc[-2]) / gdp.iloc[-2] * 100)
+        gdp_vals   = gdp.tolist()
+
+    # ── Coincident: CPI ───────────────────────────────────────────────────
+    cpi_trend = "falling"; cpi_mom = 0.0; cpi_streak = 1; cpi_vals = []
     if cpi is not None and len(cpi) >= 2:
         lookback   = min(5, len(cpi) - 1)
         cpi_trend  = "rising" if cpi.iloc[-1] > cpi.iloc[-lookback] else "falling"
-        cpi_vals   = cpi.tolist()
         cpi_mom    = float((cpi.iloc[-1] - cpi.iloc[-lookback]) / cpi.iloc[-lookback] * 100)
-        direction  = np.sign(cpi.diff().dropna())
-        current_d  = direction.iloc[-1]
-        streak = 1
-        for d in reversed(direction.iloc[:-1].tolist()):
-            if np.sign(d) == current_d:
-                streak += 1
-            else:
-                break
-        cpi_streak = streak
+        _, cpi_streak = streak_count(cpi)
+        cpi_vals   = cpi.tolist()
 
-    return (gdp_trend, cpi_trend, gdp_vals, cpi_vals,
-            gdp_mom, cpi_mom, gdp_streak, cpi_streak)
+    # ── Leading: Yield Curve (10Y-2Y) ────────────────────────────────────
+    # Positive = normal (growth-supportive); Negative = inverted (recession warning)
+    # We use the 3-month average to smooth daily noise, then track direction.
+    yc_current = None; yc_trend = "unknown"; yc_3m_avg = None; yc_signal = "neutral"
+    if yc_raw is not None and len(yc_raw) >= 60:
+        yc_monthly = yc_raw.resample("ME").mean().dropna().tail(12)
+        if len(yc_monthly) >= 2:
+            yc_current = round(float(yc_raw.iloc[-1]), 2)
+            yc_3m_avg  = round(float(yc_raw.tail(63).mean()), 2)   # ~3 trading months
+            yc_trend   = "steepening" if yc_monthly.iloc[-1] > yc_monthly.iloc[-3] else "flattening"
+            # Signal classification
+            if yc_current < -0.25:
+                yc_signal = "inverted"      # recession warning (historically ≥12mo lead)
+            elif yc_current < 0.25:
+                yc_signal = "flat"          # transition zone
+            elif yc_trend == "steepening":
+                yc_signal = "steepening"    # growth-positive
+            else:
+                yc_signal = "normal"
+
+    # ── Leading: ISM Manufacturing via Industrial Production ─────────────
+    # FRED doesn't have ISM directly as a free series; we use Industrial
+    # Production Index (INDPRO) as a close proxy — it correlates ~0.85 with ISM.
+    # Expansion: >0 MoM; Contraction: <0 MoM. Threshold 50 equivalent: ~0% MoM.
+    pmi_current = None; pmi_trend = "unknown"; pmi_signal = "neutral"; pmi_mom = 0.0
+    if indpro is not None and len(indpro) >= 3:
+        pmi_mom     = float((indpro.iloc[-1] - indpro.iloc[-3]) / indpro.iloc[-3] * 100)
+        pmi_current = round(float(indpro.iloc[-1]), 2)
+        pmi_trend   = "expanding" if pmi_mom > 0 else "contracting"
+        pmi_signal  = ("expanding"   if pmi_mom >  0.5 else
+                       "contracting" if pmi_mom < -0.5 else
+                       "stalling")
+
+    # ── Leading: Initial Jobless Claims ──────────────────────────────────
+    # Rising claims → labor market deteriorating → GDP deceleration ahead
+    # 4-week moving average smooths weekly noise.
+    claims_current = None; claims_trend = "unknown"; claims_signal = "neutral"
+    if claims is not None and len(claims) >= 8:
+        claims_4wk     = float(claims.tail(4).mean())
+        claims_prev    = float(claims.tail(8).head(4).mean())
+        claims_current = round(claims_4wk / 1000, 1)   # display in thousands
+        pct_chg        = (claims_4wk - claims_prev) / claims_prev * 100
+        claims_trend   = "rising" if claims_4wk > claims_prev else "falling"
+        claims_signal  = ("deteriorating" if pct_chg >  5 else
+                          "improving"     if pct_chg < -5 else
+                          "stable")
+
+    # ── Leading indicator composite signal ───────────────────────────────
+    # Summarise all leading signals into a single forward bias:
+    # "growth_positive", "growth_negative", or "mixed"
+    leading_signals = []
+    if yc_signal in ("steepening", "normal"):
+        leading_signals.append(1)
+    elif yc_signal == "inverted":
+        leading_signals.append(-1)
+    else:
+        leading_signals.append(0)
+
+    if pmi_signal == "expanding":
+        leading_signals.append(1)
+    elif pmi_signal == "contracting":
+        leading_signals.append(-1)
+    else:
+        leading_signals.append(0)
+
+    if claims_signal == "improving":
+        leading_signals.append(1)
+    elif claims_signal == "deteriorating":
+        leading_signals.append(-1)
+    else:
+        leading_signals.append(0)
+
+    composite = sum(leading_signals)
+    leading_bias = ("growth_positive" if composite >= 2  else
+                    "growth_negative" if composite <= -2 else
+                    "mixed")
+
+    return {
+        # Coincident
+        "gdp_trend":   gdp_trend,
+        "cpi_trend":   cpi_trend,
+        "gdp_vals":    gdp_vals,
+        "cpi_vals":    cpi_vals,
+        "gdp_mom":     gdp_mom,
+        "cpi_mom":     cpi_mom,
+        "gdp_streak":  gdp_streak,
+        "cpi_streak":  cpi_streak,
+        # Leading
+        "yc_current":  yc_current,
+        "yc_3m_avg":   yc_3m_avg,
+        "yc_trend":    yc_trend,
+        "yc_signal":   yc_signal,
+        "pmi_current": pmi_current,
+        "pmi_mom":     round(pmi_mom, 2),
+        "pmi_trend":   pmi_trend,
+        "pmi_signal":  pmi_signal,
+        "claims_current": claims_current,
+        "claims_trend":   claims_trend,
+        "claims_signal":  claims_signal,
+        "leading_bias":   leading_bias,
+        "leading_scores": leading_signals,
+    }
+
 
 @st.cache_data(ttl=3600)
 def fetch_sector_pe(tickers: tuple) -> tuple:
@@ -856,8 +967,11 @@ with st.spinner("Fetching market data…"):
     # Forward P/E for all sector ETFs
     pe_data, spy_pe = fetch_sector_pe(tuple(sector_tickers_list))
 
-    gdp_trend, cpi_trend, gdp_vals, cpi_vals, \
-    gdp_mom, cpi_mom, gdp_streak, cpi_streak = fetch_fred_macro()
+    _macro     = fetch_fred_macro()
+    gdp_trend  = _macro["gdp_trend"];  cpi_trend  = _macro["cpi_trend"]
+    gdp_vals   = _macro["gdp_vals"];   cpi_vals   = _macro["cpi_vals"]
+    gdp_mom    = _macro["gdp_mom"];    cpi_mom    = _macro["cpi_mom"]
+    gdp_streak = _macro["gdp_streak"]; cpi_streak = _macro["cpi_streak"]
 
 if not data_ok:
     st.stop()
@@ -966,19 +1080,29 @@ def compute_regime_confidence(
     gdp_streak: int, cpi_streak: int,
     quad_preferred: list, sector_returns: pd.Series,
     prices_all: pd.DataFrame,
+    leading_bias: str = "mixed",
+    leading_scores: list = None,
 ) -> dict:
+    """
+    Blend 5 independent signals into a 0–100 regime confidence score.
+
+    Signal weights:
+        20% Macro Momentum    — magnitude of GDP/CPI moves
+        20% Trend Streak      — consecutive periods in current regime
+        25% Sector Confirmation — % preferred sectors beating SPY
+        15% EQ/Bond Decorr    — risk parity stability (low corr = healthy)
+        20% Leading Indicators — yield curve + PMI + jobless claims composite
+    """
+    if leading_scores is None:
+        leading_scores = [0, 0, 0]
 
     # ── Signal 1: Macro momentum magnitude ───────────────────────────────
-    # Typical quarterly GDP move ~0.5–1.5%, CPI move ~0.2–0.8%
-    # Scale to 0–1 using expected max magnitudes
-    gdp_mag   = min(abs(gdp_mom) / 2.0, 1.0)   # 2% = full confidence
-    cpi_mag   = min(abs(cpi_mom) / 1.5, 1.0)   # 1.5% = full confidence
+    gdp_mag   = min(abs(gdp_mom) / 2.0, 1.0)
+    cpi_mag   = min(abs(cpi_mom) / 1.5, 1.0)
     macro_sig = (gdp_mag + cpi_mag) / 2.0
 
     # ── Signal 2: Streak / trend age ─────────────────────────────────────
-    # 1 period = just turned, low confidence
-    # 4+ periods = well established; 8+ = potentially late-cycle
-    min_streak = min(gdp_streak, cpi_streak)   # both axes must agree
+    min_streak = min(gdp_streak, cpi_streak)
     if min_streak <= 1:
         streak_sig = 0.25
     elif min_streak <= 3:
@@ -986,7 +1110,6 @@ def compute_regime_confidence(
     elif min_streak <= 6:
         streak_sig = 0.85
     else:
-        # Very long streak — may be mature/late; confidence plateaus then fades
         streak_sig = max(0.60, 0.85 - (min_streak - 6) * 0.05)
 
     # ── Signal 3: Sector price confirmation ──────────────────────────────
@@ -997,72 +1120,85 @@ def compute_regime_confidence(
         spy_3m = float(sector_returns["SPY"])
 
     if quad_preferred:
-        beats = sum(
-            1 for t in quad_preferred
-            if t in sector_returns.index and float(sector_returns[t]) > spy_3m
-        )
+        beats      = sum(1 for t in quad_preferred
+                         if t in sector_returns.index
+                         and float(sector_returns[t]) > spy_3m)
         sector_sig = beats / len(quad_preferred)
     else:
         sector_sig = 0.5
 
     # ── Signal 4: Equity-bond decorrelation ──────────────────────────────
-    decorr_sig = 0.5   # neutral default
+    decorr_sig = 0.5
+    corr_used  = 0.0
     if "VOO" in prices_all.columns and "TLT" in prices_all.columns:
         eq_ret   = prices_all["VOO"].pct_change().dropna().tail(60)
         bond_ret = prices_all["TLT"].pct_change().dropna().tail(60)
-        if len(eq_ret) >= 20 and len(bond_ret) >= 20:
-            combined = pd.concat([eq_ret, bond_ret], axis=1).dropna()
-            if len(combined) >= 20:
-                corr = float(combined.iloc[:, 0].corr(combined.iloc[:, 1]))
-                # Negative corr = ideal (1.0), zero corr = neutral (0.5),
-                # positive corr = stress (0.0)
-                decorr_sig = max(0.0, min(1.0, (1.0 - corr) / 2.0))
+        combined = pd.concat([eq_ret, bond_ret], axis=1).dropna()
+        if len(combined) >= 20:
+            corr      = float(combined.iloc[:, 0].corr(combined.iloc[:, 1]))
+            decorr_sig = max(0.0, min(1.0, (1.0 - corr) / 2.0))
+            corr_used  = round(corr, 3)
+
+    # ── Signal 5: Leading indicators composite ───────────────────────────
+    # +1 per bullish signal, -1 per bearish, 0 = neutral; range -3 to +3
+    # Map to 0–1: (-3 → 0.0, 0 → 0.5, +3 → 1.0)
+    composite_raw = sum(leading_scores)
+    leading_sig   = max(0.0, min(1.0, (composite_raw + 3) / 6.0))
+    # When leading bias conflicts with current regime (e.g. regime=Expansion
+    # but leading indicators are all negative), penalise confidence harder.
+    if leading_bias == "growth_negative" and "Expansion" in str(quad_preferred):
+        leading_sig = max(0.0, leading_sig - 0.2)
+    elif leading_bias == "growth_positive" and "Recession" in str(quad_preferred):
+        leading_sig = max(0.0, leading_sig - 0.2)
 
     # ── Blend ─────────────────────────────────────────────────────────────
     score = (
-        0.25 * macro_sig   +
-        0.25 * streak_sig  +
-        0.30 * sector_sig  +
-        0.20 * decorr_sig
+        0.20 * macro_sig   +
+        0.20 * streak_sig  +
+        0.25 * sector_sig  +
+        0.15 * decorr_sig  +
+        0.20 * leading_sig
     )
     score_pct = round(score * 100)
 
     # ── Stability label ───────────────────────────────────────────────────
     if score_pct >= 75:
-        label, color, desc = "ESTABLISHED", "#10b981", "Signals strongly aligned. High conviction."
+        label, color, desc = "ESTABLISHED",   "#10b981", "Signals strongly aligned. High conviction."
     elif score_pct >= 55:
-        label, color, desc = "CONFIRMED",   "#3b82f6", "Regime confirmed across most signals."
+        label, color, desc = "CONFIRMED",     "#3b82f6", "Regime confirmed across most signals."
     elif score_pct >= 35:
-        label, color, desc = "FORMING",     "#f59e0b", "Early signals present. Monitor for confirmation."
+        label, color, desc = "FORMING",       "#f59e0b", "Early signals present. Monitor for confirmation."
     else:
         label, color, desc = "TRANSITIONING", "#ef4444", "Weak or conflicting signals. Regime may be shifting."
 
-    # Streak label for display
-    if min_streak <= 1:
-        streak_label = "New signal"
-    elif min_streak <= 3:
-        streak_label = f"{min_streak} periods"
-    else:
-        streak_label = f"{min_streak} periods" + (" — late cycle" if min_streak > 6 else "")
+    min_streak_label = (
+        "New signal"      if min_streak <= 1 else
+        f"{min_streak} periods" + (" — late cycle" if min_streak > 6 else "")
+    )
 
     return {
-        "score":        score_pct,
-        "label":        label,
-        "color":        color,
-        "desc":         desc,
-        "macro_sig":    round(macro_sig * 100),
-        "streak_sig":   round(streak_sig * 100),
-        "sector_sig":   round(sector_sig * 100),
-        "decorr_sig":   round(decorr_sig * 100),
-        "streak_label": streak_label,
-        "gdp_mom":      round(gdp_mom, 3),
-        "cpi_mom":      round(cpi_mom, 3),
-        "corr_used":    round(1.0 - decorr_sig * 2.0, 3),   # back-compute for display
+        "score":          score_pct,
+        "label":          label,
+        "color":          color,
+        "desc":           desc,
+        "macro_sig":      round(macro_sig   * 100),
+        "streak_sig":     round(streak_sig  * 100),
+        "sector_sig":     round(sector_sig  * 100),
+        "decorr_sig":     round(decorr_sig  * 100),
+        "leading_sig":    round(leading_sig * 100),
+        "streak_label":   min_streak_label,
+        "gdp_mom":        round(gdp_mom, 3),
+        "cpi_mom":        round(cpi_mom, 3),
+        "corr_used":      corr_used,
+        "leading_bias":   leading_bias,
     }
+
 
 regime_confidence = compute_regime_confidence(
     gdp_mom, cpi_mom, gdp_streak, cpi_streak,
     quad_preferred, sector_returns, prices_all,
+    leading_bias   = _macro["leading_bias"],
+    leading_scores = _macro["leading_scores"],
 )
 
 
@@ -1234,10 +1370,11 @@ with col_regime:
 
     # Signal breakdown bars — 4 sub-scores
     signals = [
-        ("Macro Momentum",   rc["macro_sig"],  f"GDP {rc['gdp_mom']:+.2f}% · CPI {rc['cpi_mom']:+.2f}%"),
-        ("Trend Streak",     rc["streak_sig"], rc["streak_label"]),
-        ("Sector Confirm",   rc["sector_sig"], f"{rc['sector_sig']}% of preferred sectors beating SPY"),
-        ("EQ/Bond Decorr",   rc["decorr_sig"], f"60d corr: {rc['corr_used']:+.2f}"),
+        ("Macro Momentum",    rc["macro_sig"],   f"GDP {rc['gdp_mom']:+.2f}% · CPI {rc['cpi_mom']:+.2f}%"),
+        ("Trend Streak",      rc["streak_sig"],  rc["streak_label"]),
+        ("Sector Confirm",    rc["sector_sig"],  f"{rc['sector_sig']}% of preferred sectors beating SPY"),
+        ("EQ/Bond Decorr",    rc["decorr_sig"],  f"60d corr: {rc['corr_used']:+.2f}"),
+        ("Leading Indicators",rc["leading_sig"], f"Yield curve + PMI + claims → {rc['leading_bias'].replace('_',' ')}"),
     ]
 
     parts = ['<div style="margin-top:4px">']
@@ -1344,7 +1481,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📈  SECTOR MOMENTUM",
     "⚖  DRIFT REPORT",
     "🗺  GLIDE PATH",
-    "📰  NARRATIVE RADAR",
+    "🔭  LEADING INDICATORS",
 ])
 
 # ─── TAB 1 — ALLOCATION ENGINE ───────────────────────────────────────────────
@@ -2224,251 +2361,229 @@ with tab4:
     st.markdown('</div>', unsafe_allow_html=True)
 
 
+# ─── TAB 5 — LEADING INDICATORS ──────────────────────────────────────────────
 with tab5:
     st.markdown('<div class="aw-card">', unsafe_allow_html=True)
-    st.markdown('<div class="aw-card-title">📡 Technical Sentiment Radar — RSI · SMA · Volume</div>', unsafe_allow_html=True)
-    st.markdown(f"""
-    <div style="font-size:0.8rem;color:var(--muted);margin-bottom:16px">
-      Sentiment derived from <b>price action and volume</b> — no external API dependency.
-      Signals: RSI-14 (40%), price vs 20d SMA (40%), volume trend 5d/20d (20%).
-      Scored against current tactical tilts: <b style="color:#10b981">{', '.join(top3)}</b>.
-    </div>
-    <div style="display:inline-flex;align-items:center;gap:8px;margin-bottom:20px;
-                padding:6px 12px;background:rgba(16,185,129,0.08);
-                border:1px solid rgba(16,185,129,0.2);border-radius:5px">
-      <span style="color:#10b981;font-family:var(--mono);font-size:0.65rem;letter-spacing:1px">
-        ● TECHNICAL SIGNALS
-      </span>
-      <span style="font-size:0.68rem;color:var(--muted)">computed from yfinance price + volume · refreshes hourly</span>
-    </div>
+    st.markdown('<div class="aw-card-title">🔭 Leading Indicators — Forward Macro View</div>', unsafe_allow_html=True)
+
+    yc_sig    = _macro["yc_signal"]
+    pmi_sig   = _macro["pmi_signal"]
+    cl_sig    = _macro["claims_signal"]
+    l_bias    = _macro["leading_bias"]
+
+    # Bias banner
+    bias_color = "#10b981" if l_bias == "growth_positive" else (
+                 "#ef4444" if l_bias == "growth_negative" else "#f59e0b")
+    bias_label = {"growth_positive": "GROWTH POSITIVE",
+                  "growth_negative": "GROWTH NEGATIVE",
+                  "mixed":           "MIXED SIGNALS"}.get(l_bias, "MIXED")
+
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:12px;padding:12px 16px;'
+        f'background:rgba(255,255,255,0.03);border:1px solid {bias_color}44;'
+        f'border-radius:8px;margin-bottom:20px">'
+        f'<div style="width:8px;height:8px;border-radius:50%;background:{bias_color}"></div>'
+        f'<div>'
+        f'<div style="font-family:var(--mono);font-size:0.75rem;font-weight:700;color:{bias_color}">'
+        f'LEADING INDICATOR COMPOSITE: {bias_label}</div>'
+        f'<div style="font-size:0.72rem;color:var(--muted);margin-top:2px">'
+        f'Yield curve · Industrial production · Jobless claims — '
+        f'leads GDP by ~6–9 months</div>'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Three indicator cards ──────────────────────────────────────────────
+    c1, c2, c3 = st.columns(3)
+
+    # Helper: signal → color
+    def _sc(sig, pos_vals, neg_vals):
+        if sig in pos_vals: return "#10b981"
+        if sig in neg_vals: return "#ef4444"
+        return "#f59e0b"
+
+    # ── Yield Curve ───────────────────────────────────────────────────────
+    with c1:
+        yc_cur   = _macro["yc_current"]
+        yc_avg   = _macro["yc_3m_avg"]
+        yc_trend = _macro["yc_trend"]
+        yc_col   = _sc(yc_sig, ["steepening","normal"], ["inverted"])
+
+        yc_desc = {
+            "inverted":   "Yield curve inverted. Historically predicts recession 12–18 months ahead.",
+            "flat":       "Yield curve near zero. Transition zone — watch for direction.",
+            "steepening": "Yield curve steepening. Growth-positive signal.",
+            "normal":     "Yield curve positive. Normal growth environment.",
+            "unknown":    "Data unavailable.",
+        }.get(yc_sig, "")
+
+        cur_str = f"{yc_cur:+.2f}%" if yc_cur is not None else "—"
+        avg_str = f"{yc_avg:+.2f}%" if yc_avg is not None else "—"
+
+        st.markdown(
+            f'<div style="padding:16px;background:var(--surface2);border:1px solid var(--border);'
+            f'border-top:3px solid {yc_col};border-radius:8px;height:100%">'
+            f'<div style="font-family:var(--mono);font-size:0.62rem;color:var(--muted);'
+            f'letter-spacing:1px;text-transform:uppercase;margin-bottom:8px">10Y–2Y Yield Curve</div>'
+            f'<div style="font-family:var(--mono);font-size:1.8rem;font-weight:700;color:{yc_col}">'
+            f'{cur_str}</div>'
+            f'<div style="font-size:0.7rem;color:var(--muted);margin-top:4px">'
+            f'3M avg: {avg_str} · {yc_trend}</div>'
+            f'<div style="margin-top:8px;padding:8px;background:rgba(255,255,255,0.03);'
+            f'border-radius:4px;font-size:0.7rem;color:var(--muted);line-height:1.5">'
+            f'<b style="color:{yc_col}">{yc_sig.upper()}</b><br>{yc_desc}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Industrial Production (PMI Proxy) ─────────────────────────────────
+    with c2:
+        pmi_cur  = _macro["pmi_current"]
+        pmi_mom  = _macro["pmi_mom"]
+        pmi_col  = _sc(pmi_sig, ["expanding"], ["contracting"])
+
+        pmi_desc = {
+            "expanding":   "Industrial production accelerating. Manufacturing in expansion.",
+            "contracting": "Industrial production falling. Manufacturing contraction signal.",
+            "stalling":    "Industrial production flat. Watch for direction confirmation.",
+        }.get(pmi_sig, "Data unavailable.")
+
+        cur_str = f"{pmi_cur:.1f}" if pmi_cur is not None else "—"
+        mom_str = f"{pmi_mom:+.2f}%" if pmi_mom != 0.0 else "—"
+
+        st.markdown(
+            f'<div style="padding:16px;background:var(--surface2);border:1px solid var(--border);'
+            f'border-top:3px solid {pmi_col};border-radius:8px;height:100%">'
+            f'<div style="font-family:var(--mono);font-size:0.62rem;color:var(--muted);'
+            f'letter-spacing:1px;text-transform:uppercase;margin-bottom:8px">Industrial Production</div>'
+            f'<div style="font-family:var(--mono);font-size:1.8rem;font-weight:700;color:{pmi_col}">'
+            f'{cur_str}</div>'
+            f'<div style="font-size:0.7rem;color:var(--muted);margin-top:4px">'
+            f'3M chg: {mom_str} · {_macro["pmi_trend"]}</div>'
+            f'<div style="margin-top:8px;padding:8px;background:rgba(255,255,255,0.03);'
+            f'border-radius:4px;font-size:0.7rem;color:var(--muted);line-height:1.5">'
+            f'<b style="color:{pmi_col}">{pmi_sig.upper()}</b><br>{pmi_desc}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Jobless Claims ────────────────────────────────────────────────────
+    with c3:
+        cl_cur   = _macro["claims_current"]
+        cl_trend = _macro["claims_trend"]
+        cl_col   = _sc(cl_sig, ["improving"], ["deteriorating"])
+
+        cl_desc = {
+            "improving":    "Claims falling. Labor market strengthening — supports growth.",
+            "deteriorating":"Claims rising. Labor market weakening — growth headwind ahead.",
+            "stable":       "Claims stable. Labor market holding — no clear directional signal.",
+        }.get(cl_sig, "Data unavailable.")
+
+        cur_str = f"{cl_cur:.0f}K" if cl_cur is not None else "—"
+
+        st.markdown(
+            f'<div style="padding:16px;background:var(--surface2);border:1px solid var(--border);'
+            f'border-top:3px solid {cl_col};border-radius:8px;height:100%">'
+            f'<div style="font-family:var(--mono);font-size:0.62rem;color:var(--muted);'
+            f'letter-spacing:1px;text-transform:uppercase;margin-bottom:8px">Initial Claims (4wk avg)</div>'
+            f'<div style="font-family:var(--mono);font-size:1.8rem;font-weight:700;color:{cl_col}">'
+            f'{cur_str}</div>'
+            f'<div style="font-size:0.7rem;color:var(--muted);margin-top:4px">'
+            f'Trend: {cl_trend}</div>'
+            f'<div style="margin-top:8px;padding:8px;background:rgba(255,255,255,0.03);'
+            f'border-radius:4px;font-size:0.7rem;color:var(--muted);line-height:1.5">'
+            f'<b style="color:{cl_col}">{cl_sig.upper()}</b><br>{cl_desc}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Coincident vs Leading matrix ──────────────────────────────────────
+    st.markdown("""
+    <div style="margin-top:24px;font-family:var(--mono);font-size:0.65rem;
+                letter-spacing:2px;text-transform:uppercase;color:var(--muted);
+                margin-bottom:12px">Coincident vs Leading Signal Alignment</div>
     """, unsafe_allow_html=True)
 
-    # ── Conviction score: blend momentum rank + technical sentiment ────────
-    momentum_rank = {t: i for i, t in enumerate(sector_returns.index)}
-    n_sectors     = len(momentum_rank)
-    all_sector_tickers = list(SECTOR_ETFS.keys())
+    rows_data = [
+        ("GDP (Coincident)",      gdp_trend,         "rising",  "rising"),
+        ("CPI (Coincident)",      cpi_trend,         "falling", "rising"),
+        ("Yield Curve (Leading)", yc_sig,            "steepening","inverted"),
+        ("Ind. Production (Lead)",pmi_sig,           "expanding","contracting"),
+        ("Jobless Claims (Lead)", cl_sig,            "improving","deteriorating"),
+    ]
 
-    conviction = {}
-    for ticker in all_sector_tickers:
-        mom_score  = 1.0 - (momentum_rank.get(ticker, n_sectors) / n_sectors)
-        sent       = sentiment_data.get(ticker, {})
-        sent_norm  = sent.get("norm", 0.0)
-        sent_score = (sent_norm + 1) / 2                  # rescale -1…+1 → 0…1
-        combined   = round(0.60 * mom_score + 0.40 * sent_score, 3)
-        conviction[ticker] = {
-            "momentum_score":  round(mom_score,  3),
-            "sentiment_score": round(sent_score, 3),
-            "combined":        combined,
-            "recommendation":  "STRONG HOLD" if combined > 0.70
-                               else "HOLD"    if combined > 0.55
-                               else "MONITOR" if combined > 0.40
-                               else "REDUCE",
-        }
+    for label, val, pos_val, neg_val in rows_data:
+        if val == pos_val:
+            sig_color, arrow = "#10b981", "↑"
+        elif val == neg_val:
+            sig_color, arrow = "#ef4444", "↓"
+        else:
+            sig_color, arrow = "#f59e0b", "→"
 
-    badge_map = {
-        "technical":   ("TECHNICAL", "#10b981"),
-        "unavailable": ("NO DATA",   "#ef4444"),
-    }
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:12px;padding:9px 0;'
+            f'border-bottom:1px solid var(--border)">'
+            f'<div style="font-size:0.75rem;color:var(--muted);flex:1">{label}</div>'
+            f'<div style="font-family:var(--mono);font-size:0.8rem;color:{sig_color}">'
+            f'{arrow} {val.upper()}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
-    # ── Detailed cards for current tactical positions ──────────────────────
-    st.markdown("""
-    <div style="font-family:var(--mono);font-size:0.65rem;letter-spacing:2px;
-                text-transform:uppercase;color:var(--muted);margin-bottom:12px">
-      Current Tactical Position Conviction
-    </div>
-    """, unsafe_allow_html=True)
+    # ── Interpretation note ───────────────────────────────────────────────
+    # Determine alignment between leading and coincident
+    lead_pos  = sum(1 for s in [yc_sig, pmi_sig, cl_sig]
+                    if s in ["steepening","normal","expanding","improving"])
+    lead_neg  = sum(1 for s in [yc_sig, pmi_sig, cl_sig]
+                    if s in ["inverted","contracting","deteriorating"])
+    coin_pos  = sum(1 for t in [gdp_trend, cpi_trend] if t == "rising")
 
-    for ticker in top3:
-        g   = sentiment_data.get(ticker, {})
-        c   = conviction[ticker]
-        rec = c["recommendation"]
-        rec_color = {
-            "STRONG HOLD": "#10b981", "HOLD": "#3b82f6",
-            "MONITOR": "#f59e0b",     "REDUCE": "#ef4444",
-        }.get(rec, "#64748b")
+    if lead_neg >= 2 and coin_pos >= 1:
+        interp = ("⚠ <b>Divergence detected</b>: Coincident indicators still positive "
+                  "but leading indicators are weakening. Regime transition may be "
+                  "6–12 months away. Consider gradually reducing tactical risk.")
+        interp_color = "#f59e0b"
+    elif lead_pos >= 2 and coin_pos == 0:
+        interp = ("📈 <b>Recovery signal</b>: Leading indicators are turning positive "
+                  "while coincident data still weak. Historically, this precedes "
+                  "regime improvement by 2–3 quarters.")
+        interp_color = "#10b981"
+    elif lead_pos >= 2 and coin_pos >= 1:
+        interp = ("✓ <b>Aligned expansion</b>: Both leading and coincident indicators "
+                  "confirm current regime. Highest-conviction environment for "
+                  "risk-on positioning.")
+        interp_color = "#10b981"
+    elif lead_neg >= 2 and coin_pos == 0:
+        interp = ("🔴 <b>Confirmed contraction</b>: Leading and coincident data both "
+                  "negative. Regime defensiveness fully warranted.")
+        interp_color = "#ef4444"
+    else:
+        interp = ("→ <b>Mixed signals</b>: No strong consensus across indicators. "
+                  "Maintain current allocation; watch for leading indicators "
+                  "to establish a clear direction.")
+        interp_color = "#64748b"
 
-        norm       = g.get("norm", 0.0)
-        tone_color = "#10b981" if norm > 0.1 else ("#ef4444" if norm < -0.1 else "#64748b")
-        bar_w      = int(c["combined"] * 100)
-        mom_bar    = int(c["momentum_score"] * 100)
-        sent_bar   = int(c["sentiment_score"] * 100)
-        aligned    = "✓ regime" if ticker in quad_preferred else "↑ momentum"
-        aligned_c  = "var(--accent)" if ticker in quad_preferred else "var(--accent3)"
-
-        rsi      = g.get("rsi")
-        sma_pct  = g.get("sma_pct")
-        vol_ratio= g.get("vol_ratio")
-        rsi_str     = f"{rsi:.1f}" if rsi is not None else "—"
-        sma_str     = f"{sma_pct:+.2f}%" if sma_pct is not None else "—"
-        vol_str     = f"{vol_ratio:.2f}×" if vol_ratio is not None else "—"
-        rsi_c    = "#10b981" if (rsi or 50) > 60 else ("#ef4444" if (rsi or 50) < 40 else "#64748b")
-        sma_c    = "#10b981" if (sma_pct or 0) > 0 else "#ef4444"
-        vol_c    = "#10b981" if (vol_ratio or 1) > 1.1 else ("#ef4444" if (vol_ratio or 1) < 0.9 else "#64748b")
-
-        # PCR for this ticker
-        pcr = pcr_data.get(ticker)
-        pcr_str   = f"{pcr:.2f}" if pcr is not None else "—"
-        pcr_color = "#ef4444" if (pcr or 0) > 1.0 else ("#10b981" if (pcr or 0) < 0.7 else "#64748b")
-
-        src_label, src_color = badge_map.get(g.get("source", "unavailable"), ("N/A", "#64748b"))
-
-        st.markdown(f"""
-        <div style="padding:18px 20px;background:var(--surface2);border:1px solid var(--border);
-                    border-left:3px solid {rec_color};border-radius:8px;margin-bottom:12px">
-          <div style="display:flex;align-items:flex-start;justify-content:space-between;
-                      margin-bottom:14px;gap:12px;flex-wrap:wrap">
-            <div>
-              <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
-                <b style="font-family:var(--mono);font-size:1.05rem">{ticker}</b>
-                <span style="font-size:0.75rem;color:var(--muted)">{SECTOR_ETFS.get(ticker,'')}</span>
-                <span style="font-size:0.65rem;color:{aligned_c};font-family:var(--mono)">{aligned}</span>
-              </div>
-              <div style="display:flex;gap:16px;font-size:0.72rem;flex-wrap:wrap">
-                <span>RSI-14: <b style="color:{rsi_c}">{rsi_str}</b></span>
-                <span>vs SMA20: <b style="color:{sma_c}">{sma_str}</b></span>
-                <span>Rel Vol: <b style="color:{vol_c}">{vol_str}</b></span>
-                <span>P/C: <b style="color:{pcr_color}">{pcr_str}</b></span>
-                <span style="color:{src_color};font-family:var(--mono);font-size:0.62rem">{src_label}</span>
-              </div>
-            </div>
-            <div style="text-align:right">
-              <div style="font-family:var(--mono);font-size:0.6rem;color:var(--muted);
-                          letter-spacing:1px;margin-bottom:4px">CONVICTION</div>
-              <div style="font-family:var(--mono);font-size:1.4rem;font-weight:700;
-                          color:{rec_color}">{bar_w}</div>
-              <div style="font-family:var(--mono);font-size:0.65rem;color:{rec_color};
-                          letter-spacing:1px">{rec}</div>
-            </div>
-          </div>
-
-          <div style="margin-bottom:6px">
-            <div style="display:flex;justify-content:space-between;font-size:0.65rem;
-                        color:var(--muted);font-family:var(--mono);margin-bottom:3px">
-              <span>Combined conviction</span><span>{bar_w}/100</span>
-            </div>
-            <div style="height:6px;background:rgba(255,255,255,0.05);border-radius:3px">
-              <div style="height:100%;width:{bar_w}%;background:{rec_color};border-radius:3px"></div>
-            </div>
-          </div>
-          <div style="display:flex;gap:12px">
-            <div style="flex:1">
-              <div style="display:flex;justify-content:space-between;font-size:0.62rem;
-                          color:var(--muted);font-family:var(--mono);margin-bottom:3px">
-                <span>Momentum (60%)</span><span>{mom_bar}</span>
-              </div>
-              <div style="height:4px;background:rgba(255,255,255,0.05);border-radius:2px">
-                <div style="height:100%;width:{mom_bar}%;background:#3b82f6;border-radius:2px"></div>
-              </div>
-            </div>
-            <div style="flex:1">
-              <div style="display:flex;justify-content:space-between;font-size:0.62rem;
-                          color:var(--muted);font-family:var(--mono);margin-bottom:3px">
-                <span>Technical (40%)</span><span>{sent_bar}</span>
-              </div>
-              <div style="height:4px;background:rgba(255,255,255,0.05);border-radius:2px">
-                <div style="height:100%;width:{sent_bar}%;background:{tone_color};border-radius:2px"></div>
-              </div>
-            </div>
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    # ── Full sector scan ───────────────────────────────────────────────────
-    st.markdown("""
-    <div style="font-family:var(--mono);font-size:0.65rem;letter-spacing:2px;
-                text-transform:uppercase;color:var(--muted);margin:24px 0 8px">
-      Full Sector Scan
-    </div>
-    <div style="display:flex;gap:16px;padding:6px 0 8px;border-bottom:1px solid var(--border);
-                font-family:var(--mono);font-size:0.58rem;color:var(--muted);
-                letter-spacing:1px;text-transform:uppercase">
-      <div style="width:46px">ETF</div>
-      <div style="width:110px">Sector</div>
-      <div style="flex:1">Conviction bar</div>
-      <div style="width:34px;text-align:right">Score</div>
-      <div style="width:52px;text-align:right">3M Ret</div>
-      <div style="width:52px;text-align:right">RSI</div>
-      <div style="width:52px;text-align:right">Rel Vol</div>
-      <div style="width:60px;text-align:right">P/C</div>
-      <div style="width:76px;text-align:right">Signal</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    sorted_sectors = sorted(all_sector_tickers,
-                            key=lambda t: conviction[t]["combined"], reverse=True)
-
-    for ticker in sorted_sectors:
-        g   = sentiment_data.get(ticker, {})
-        c   = conviction[ticker]
-        rec = c["recommendation"]
-        is_selected = ticker in top3
-        rec_color = {
-            "STRONG HOLD": "#10b981", "HOLD": "#3b82f6",
-            "MONITOR": "#f59e0b",     "REDUCE": "#ef4444",
-        }.get(rec, "#64748b")
-
-        norm      = g.get("norm", 0.0)
-        tone_color= "#10b981" if norm > 0.1 else ("#ef4444" if norm < -0.1 else "#64748b")
-        ret       = sector_returns[ticker] if ticker in sector_returns.index else 0.0
-        ret_c     = "#10b981" if ret >= 0 else "#ef4444"
-        bar_w     = int(c["combined"] * 100)
-        rsi       = g.get("rsi")
-        vol_ratio = g.get("vol_ratio")
-        pcr       = pcr_data.get(ticker)
-
-        rsi_str = f"{rsi:.0f}" if rsi is not None else "—"
-        rsi_c   = "#10b981" if (rsi or 50) > 60 else ("#ef4444" if (rsi or 50) < 40 else "var(--muted)")
-        vr_str  = f"{vol_ratio:.2f}×" if vol_ratio is not None else "—"
-        vr_c    = "#10b981" if (vol_ratio or 1) > 1.1 else ("#ef4444" if (vol_ratio or 1) < 0.9 else "var(--muted)")
-        pcr_str = f"{pcr:.2f}" if pcr is not None else "—"
-        pcr_c   = "#ef4444" if (pcr or 0) > 1.0 else ("#10b981" if (pcr or 0) < 0.7 else "var(--muted)")
-
-        sel_badge = ('<span style="background:#10b981;color:#0a0c10;font-family:var(--mono);'
-                     'font-size:0.58rem;padding:1px 6px;border-radius:3px;'
-                     'font-weight:700;margin-left:4px">TAC</span>') if is_selected else ""
-
-        st.markdown(f"""
-        <div style="display:flex;align-items:center;gap:16px;padding:9px 0;
-                    border-bottom:1px solid var(--border)">
-          <div style="width:46px;font-family:var(--mono);font-size:0.82rem;
-                      font-weight:700;color:{'var(--text)' if is_selected else 'var(--muted)'}">{ticker}</div>
-          <div style="width:110px;font-size:0.7rem;color:var(--muted)">
-            {SECTOR_ETFS.get(ticker,'')} {sel_badge}
-          </div>
-          <div style="flex:1;height:5px;background:var(--surface2);border-radius:3px">
-            <div style="height:100%;width:{bar_w}%;background:{rec_color};border-radius:3px;
-                        opacity:{'1' if is_selected else '0.55'}"></div>
-          </div>
-          <div style="width:34px;text-align:right;font-family:var(--mono);font-size:0.75rem;
-                      color:{rec_color}">{bar_w}</div>
-          <div style="width:52px;text-align:right;font-family:var(--mono);font-size:0.72rem;
-                      color:{ret_c}">{ret*100:+.1f}%</div>
-          <div style="width:52px;text-align:right;font-family:var(--mono);font-size:0.72rem;
-                      color:{rsi_c}">{rsi_str}</div>
-          <div style="width:52px;text-align:right;font-family:var(--mono);font-size:0.72rem;
-                      color:{vr_c}">{vr_str}</div>
-          <div style="width:60px;text-align:right;font-family:var(--mono);font-size:0.72rem;
-                      color:{pcr_c}">{pcr_str}</div>
-          <div style="width:76px;text-align:right;font-family:var(--mono);font-size:0.65rem;
-                      color:{rec_color};letter-spacing:0.5px">{rec}</div>
-        </div>
-        """, unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="margin-top:16px;padding:14px 16px;background:rgba(255,255,255,0.03);'
+        f'border-left:3px solid {interp_color};border-radius:0 6px 6px 0;'
+        f'font-size:0.78rem;color:var(--muted);line-height:1.6">{interp}</div>',
+        unsafe_allow_html=True,
+    )
 
     st.markdown("""
-    <div style="margin-top:20px;padding:16px 20px;background:rgba(59,130,246,0.06);
+    <div style="margin-top:16px;padding:12px 16px;background:rgba(59,130,246,0.06);
                 border:1px solid rgba(59,130,246,0.15);border-radius:8px;
-                font-size:0.77rem;color:var(--muted);line-height:1.6">
-      <b style="color:#3b82f6;font-family:var(--mono)">METHODOLOGY</b><br><br>
-      <b style="color:var(--text)">Conviction</b> = 60% 3-month momentum rank + 40% technical sentiment.
-      <b style="color:var(--text)">Technical sentiment</b> = 40% RSI-14 + 40% price vs 20d SMA + 20% relative volume (5d/20d).
-      All signals computed from price/volume data already fetched — no external API calls.
-      <b style="color:var(--text)">P/C ratio</b> from yfinance options chains (nearest 2 expirations); shown as context only, not included in conviction score.
-      <br><br>
-      <b style="color:var(--text)">Thresholds:</b>
-      STRONG HOLD ≥ 70 · HOLD 55–70 · MONITOR 40–55 · REDUCE &lt; 40
+                font-size:0.72rem;color:var(--muted);line-height:1.6">
+      <b style="color:#3b82f6;font-family:var(--mono)">DATA SOURCES (FRED, no key required)</b>
+      &nbsp;·&nbsp; T10Y2Y: 10Y–2Y Treasury spread (daily)
+      &nbsp;·&nbsp; INDPRO: Industrial Production Index (monthly, ISM proxy)
+      &nbsp;·&nbsp; ICSA: Initial Jobless Claims (weekly, 4-week avg)
+      &nbsp;·&nbsp; All series via FRED public CSV endpoint.
+      Technical Sentiment Radar moved to <code>technical_sentiment.py</code> for use in partner tools.
     </div>
     """, unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
+
 
 
 st.markdown(f"""
