@@ -1681,7 +1681,283 @@ with tab1:
     </div>
     """, unsafe_allow_html=True)
 
-# ─── TAB 2 — SECTOR MOMENTUM ─────────────────────────────────────────────────
+    # ── Correlation Matrix Panel ──────────────────────────────────────────────
+    # Always include VOO + TLT as anchor pair even when not both in core —
+    # their correlation is the single most important risk parity health signal.
+    _corr_tickers = list(dict.fromkeys(
+        CORE_ASSETS + ["VOO", "TLT", "GLD"]
+    ))
+    _corr_tickers = [t for t in _corr_tickers if t in prices_all.columns]
+
+    # Compute 60d rolling correlation matrix from daily log returns
+    _rets_60d = np.log(
+        prices_all[_corr_tickers] / prices_all[_corr_tickers].shift(1)
+    ).dropna().tail(60)
+
+    _rets_1y  = np.log(
+        prices_all[_corr_tickers] / prices_all[_corr_tickers].shift(1)
+    ).dropna()
+
+    _corr_60d = _rets_60d.corr()
+    _corr_1y  = _rets_1y.corr()
+
+    # ── Alert check: equity-bond correlation ─────────────────────────────────
+    _eq_bond_corr = float(_corr_60d.loc["VOO", "TLT"]) \
+                    if ("VOO" in _corr_60d.index and "TLT" in _corr_60d.index) else 0.0
+    _rp_stressed  = _eq_bond_corr > 0.15   # positive = risk parity assumption breaking
+
+    # ── SVG heatmap builder ───────────────────────────────────────────────────
+    def _corr_color(val: float) -> str:
+        """Map correlation -1…+1 to a color.
+           -1.0 → rich green  (diversification working perfectly)
+            0.0 → near-neutral dark
+           +1.0 → rich red    (assets moving together, RP breaks down)
+        """
+        if val >= 0:
+            # 0 → dark surface, 1 → red
+            intensity = int(val * 220)
+            return f"rgb({min(239, 30 + intensity)},{max(30, 68 - intensity//3)},{max(30, 68 - intensity//2)})"
+        else:
+            # 0 → dark surface, -1 → green
+            intensity = int(-val * 220)
+            return f"rgb({max(16, 30 - intensity//3)},{min(185, 30 + intensity)},{max(80, 80 + intensity//3)})"
+
+    def _build_corr_svg(corr_df: pd.DataFrame, size: int = 300) -> str:
+        n       = len(corr_df)
+        labels  = list(corr_df.columns)
+        pad_l   = 46    # left padding for row labels
+        pad_t   = 46    # top padding for column labels
+        cell_w  = (size - pad_l) / n
+        cell_h  = (size - pad_t) / n
+        svg_w   = size + 4
+        svg_h   = size + 4
+
+        parts = [
+            f'<svg viewBox="0 0 {svg_w} {svg_h}" xmlns="http://www.w3.org/2000/svg" '
+            f'style="width:100%;max-width:{svg_w}px;font-family:Space Mono,monospace">'
+        ]
+
+        # Column labels (top)
+        for j, label in enumerate(labels):
+            x = pad_l + j * cell_w + cell_w / 2
+            parts.append(
+                f'<text x="{x:.1f}" y="{pad_t - 6}" text-anchor="middle" '
+                f'font-size="8" fill="#64748b" letter-spacing="0.5">{label}</text>'
+            )
+
+        # Row labels (left) + cells
+        for i, row in enumerate(labels):
+            y_center = pad_t + i * cell_h + cell_h / 2
+            # Row label
+            parts.append(
+                f'<text x="{pad_l - 4}" y="{y_center + 3:.1f}" text-anchor="end" '
+                f'font-size="8" fill="#64748b">{row}</text>'
+            )
+            for j, col in enumerate(labels):
+                val   = float(corr_df.loc[row, col])
+                color = _corr_color(val)
+                x0    = pad_l + j * cell_w
+                y0    = pad_t + i * cell_h
+                # Cell background
+                parts.append(
+                    f'<rect x="{x0:.1f}" y="{y0:.1f}" '
+                    f'width="{cell_w - 1:.1f}" height="{cell_h - 1:.1f}" '
+                    f'fill="{color}" rx="2"/>'
+                )
+                # Value label — skip diagonal
+                if i != j:
+                    txt_color = "#ffffff" if abs(val) > 0.4 else "#94a3b8"
+                    parts.append(
+                        f'<text x="{x0 + cell_w/2:.1f}" y="{y0 + cell_h/2 + 4:.1f}" '
+                        f'text-anchor="middle" font-size="9" fill="{txt_color}" '
+                        f'font-weight="600">{val:+.2f}</text>'
+                    )
+                else:
+                    # Diagonal — just the label repeated
+                    parts.append(
+                        f'<text x="{x0 + cell_w/2:.1f}" y="{y0 + cell_h/2 + 4:.1f}" '
+                        f'text-anchor="middle" font-size="8" fill="#475569">1.00</text>'
+                    )
+
+        parts.append('</svg>')
+        return "".join(parts)
+
+    # ── Key pairs: current vs 1-year range ───────────────────────────────────
+    _key_pairs = []
+    _pair_defs = [
+        ("VOO", "TLT", "Equity / Bond",       "Core risk parity assumption"),
+        ("VOO", "GLD", "Equity / Gold",        "Crisis hedge relationship"),
+        ("VOO", "VEA", "US / Intl Equity",     "Geographic diversification"),
+        ("TLT", "GLD", "Bond / Gold",          "Inflation hedge correlation"),
+        ("VOO", "VWO", "US / Emerging",        "EM diversification"),
+        ("IEF", "TLT", "Mid / Long Bond",      "Duration spread"),
+    ]
+    for a, b, label, desc in _pair_defs:
+        if a in _corr_60d.index and b in _corr_60d.index:
+            cur  = float(_corr_60d.loc[a, b])
+            avg  = float(_corr_1y.loc[a, b])
+            # Rolling 60d range over the past year
+            _roll = (np.log(prices_all[[a, b]] / prices_all[[a, b]].shift(1))
+                     .dropna()
+                     .rolling(60)
+                     .corr()
+                     .unstack()
+                     .dropna())
+            if not _roll.empty and (a, b) in _roll.columns:
+                lo = float(_roll[(a, b)].min())
+                hi = float(_roll[(a, b)].max())
+            else:
+                lo, hi = avg - 0.1, avg + 0.1
+            _key_pairs.append((label, desc, cur, avg, lo, hi))
+
+    # ── Render ────────────────────────────────────────────────────────────────
+    st.markdown('<div class="aw-card">', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="aw-card-title">🔗 Asset Correlation Matrix — 60-Day Rolling</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div style="font-size:0.78rem;color:var(--muted);margin-bottom:16px">'
+        'Rolling 60-day log-return correlations across core assets. '
+        'Green = negative correlation (diversification working). '
+        'Red = positive correlation (assets moving together — risk parity stress). '
+        'VOO/TLT correlation is the most critical pair to monitor.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Risk parity stress alert
+    if _rp_stressed:
+        st.markdown(
+            '<div style="padding:12px 16px;background:rgba(239,68,68,0.08);'
+            'border:1px solid rgba(239,68,68,0.35);border-radius:8px;'
+            'margin-bottom:16px;display:flex;align-items:center;gap:12px">'
+            '<span style="font-size:1.4rem">⚠</span>'
+            '<div>'
+            '<div style="font-family:var(--mono);font-weight:700;color:#ef4444;font-size:0.8rem">'
+            f'RISK PARITY STRESS — Equity/Bond corr: {_eq_bond_corr:+.2f}'
+            '</div>'
+            '<div style="font-size:0.75rem;color:var(--muted);margin-top:3px">'
+            'VOO and TLT are moving in the same direction over the past 60 days. '
+            'The core diversification assumption is weakened. '
+            'This was the 2022 dynamic — consider reviewing hedge allocation.'
+            '</div>'
+            '</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        eq_bond_color = "#10b981" if _eq_bond_corr < -0.1 else "#f59e0b"
+        st.markdown(
+            f'<div style="padding:8px 14px;background:rgba(16,185,129,0.06);'
+            f'border:1px solid rgba(16,185,129,0.2);border-radius:6px;'
+            f'margin-bottom:16px;font-family:var(--mono);font-size:0.72rem">'
+            f'✓ Risk parity healthy — Equity/Bond corr: '
+            f'<b style="color:{eq_bond_color}">{_eq_bond_corr:+.2f}</b> '
+            f'(negative = diversification working)'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # Matrix + key pairs side by side
+    mat_col, pairs_col = st.columns([1, 1.2])
+
+    with mat_col:
+        _svg = _build_corr_svg(_corr_60d, size=300)
+        st.markdown(_svg, unsafe_allow_html=True)
+
+        # Color scale legend
+        st.markdown(
+            '<div style="display:flex;align-items:center;gap:8px;margin-top:8px;'
+            'font-family:var(--mono);font-size:0.62rem;color:var(--muted)">'
+            '<span>−1.0</span>'
+            '<div style="flex:1;height:6px;border-radius:3px;'
+            'background:linear-gradient(to right,rgb(16,185,129),rgb(30,37,53),rgb(239,68,68))"></div>'
+            '<span>+1.0</span>'
+            '</div>'
+            '<div style="font-family:var(--mono);font-size:0.6rem;color:var(--muted);'
+            'text-align:center;margin-top:4px">60-day rolling log returns</div>',
+            unsafe_allow_html=True,
+        )
+
+    with pairs_col:
+        st.markdown(
+            '<div style="font-family:var(--mono);font-size:0.62rem;color:var(--muted);'
+            'letter-spacing:1px;text-transform:uppercase;margin-bottom:10px">'
+            'Key Pairs — Current vs 1Y Range</div>',
+            unsafe_allow_html=True,
+        )
+
+        for label, desc, cur, avg, lo, hi in _key_pairs:
+            # Clamp range for bar positioning
+            lo_c  = max(-1.0, lo)
+            hi_c  = min(1.0, hi)
+            span  = hi_c - lo_c if hi_c > lo_c else 0.01
+            # Position of current value along the range bar (0-100%)
+            cur_pos = max(0, min(100, (cur - lo_c) / span * 100))
+            avg_pos = max(0, min(100, (avg - lo_c) / span * 100))
+
+            cur_color = (
+                "#10b981" if cur < -0.10 else
+                "#f59e0b" if cur <  0.15 else
+                "#ef4444"
+            )
+            # Stress indicator
+            stress = "⚠" if (label == "Equity / Bond" and cur > 0.15) else ""
+
+            parts = [
+                f'<div style="margin-bottom:14px">',
+                f'<div style="display:flex;justify-content:space-between;'
+                f'font-size:0.7rem;margin-bottom:4px">',
+                f'<span style="color:var(--text)">{label} {stress}</span>',
+                f'<span style="font-family:var(--mono);color:{cur_color};font-weight:700">'
+                f'{cur:+.2f}</span>',
+                f'</div>',
+                # Range bar
+                f'<div style="position:relative;height:8px;background:var(--surface2);'
+                f'border-radius:4px;margin-bottom:3px">',
+                # Zero line
+                f'<div style="position:absolute;left:{max(0, min(100, (-lo_c/span*100))):.0f}%;'
+                f'top:0;bottom:0;width:1px;background:#334155"></div>',
+                # 1Y avg marker
+                f'<div style="position:absolute;left:{avg_pos:.0f}%;top:-2px;bottom:-2px;'
+                f'width:2px;background:#64748b;border-radius:1px" title="1Y avg"></div>',
+                # Current value marker
+                f'<div style="position:absolute;left:{cur_pos:.0f}%;'
+                f'top:-3px;bottom:-3px;width:3px;background:{cur_color};'
+                f'border-radius:2px;transform:translateX(-50%)"></div>',
+                f'</div>',
+                # Range labels
+                f'<div style="display:flex;justify-content:space-between;'
+                f'font-family:var(--mono);font-size:0.58rem;color:var(--muted)">',
+                f'<span>{lo_c:+.2f}</span>',
+                f'<span style="color:#475569">avg {avg:+.2f}</span>',
+                f'<span>{hi_c:+.2f}</span>',
+                f'</div>',
+                f'<div style="font-size:0.62rem;color:var(--muted);margin-top:1px">'
+                f'{desc}</div>',
+                f'</div>',
+            ]
+            st.markdown("".join(parts), unsafe_allow_html=True)
+
+    # ── Window selector ───────────────────────────────────────────────────────
+    st.markdown(
+        '<div style="margin-top:12px;padding:10px 14px;background:var(--surface2);'
+        'border:1px solid var(--border);border-radius:6px;'
+        'font-size:0.7rem;color:var(--muted);font-family:var(--mono)">'
+        '<b style="color:var(--text)">Reading the matrix:</b> '
+        'Values near −1 mean assets move opposite each other — ideal for risk parity. '
+        'Values near 0 mean independence — diversification is partial. '
+        'Values above +0.15 on any equity/bond pair signal a breakdown of the '
+        'uncorrelated-asset assumption that underpins the entire core bucket strategy. '
+        'The 1-year range bars show whether today\'s correlation is historically '
+        'elevated or normal for each pair.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
 with tab2:
     st.markdown('<div class="aw-card">', unsafe_allow_html=True)
     st.markdown('<div class="aw-card-title">📈 S&P 500 Sector Momentum — 3M Return · Vol · P/C · Fwd P/E</div>', unsafe_allow_html=True)
@@ -2247,9 +2523,17 @@ with tab3:
     buys  = drift_edit[drift_edit["Action"] == "▲ BUY"]["Ticker"].tolist()
     sells = drift_edit[drift_edit["Action"] == "▼ SELL"]["Ticker"].tolist()
     drift_color = "#10b981" if total_drift < 5 else "#f59e0b" if total_drift < 15 else "#ef4444"
-    drift_msg   = "✓ Within tolerance" if total_drift < 5 else "⚠ Rebalance recommended" if total_drift < 15 else "🚨 Immediate rebalance required"
-    buys_html  = " ".join(f'<span style="background:rgba(59,130,246,0.15);color:#3b82f6;font-family:var(--mono);font-size:0.65rem;padding:2px 7px;border-radius:3px">{t}</span>' for t in buys)  or "—"
-    sells_html = " ".join(f'<span style="background:rgba(239,68,68,0.12);color:#ef4444;font-family:var(--mono);font-size:0.65rem;padding:2px 7px;border-radius:3px">{t}</span>' for t in sells) or "—"
+    drift_msg   = ("✓ Within tolerance"         if total_drift < 5  else
+                   "⚠ Rebalance recommended"    if total_drift < 15 else
+                   "🚨 Immediate rebalance required")
+    buys_html  = " ".join(
+        f'<span style="background:rgba(59,130,246,0.15);color:#3b82f6;'
+        f'font-family:var(--mono);font-size:0.65rem;padding:2px 7px;border-radius:3px">{t}</span>'
+        for t in buys) or "—"
+    sells_html = " ".join(
+        f'<span style="background:rgba(239,68,68,0.12);color:#ef4444;'
+        f'font-family:var(--mono);font-size:0.65rem;padding:2px 7px;border-radius:3px">{t}</span>'
+        for t in sells) or "—"
     st.markdown(f"""
     <div style="margin-top:20px;padding:16px 20px;background:var(--surface2);
                 border:1px solid var(--border);border-radius:8px;">
@@ -2275,6 +2559,320 @@ with tab3:
     </div>
     """, unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # REBALANCING RULES ENGINE
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown('<div class="aw-card" style="margin-top:20px">', unsafe_allow_html=True)
+    st.markdown('<div class="aw-card-title">⚙ Rebalancing Rules Engine</div>', unsafe_allow_html=True)
+
+    # ── Rebalancing settings ────────────────────────────────────────────────
+    rb_col1, rb_col2, rb_col3 = st.columns(3)
+    with rb_col1:
+        tolerance_band = st.slider(
+            "Tolerance band (%)", min_value=1, max_value=15, value=5, step=1,
+            help="Positions drifting beyond this % from target trigger a rebalance order.",
+            key="rb_tolerance",
+        )
+    with rb_col2:
+        rebal_freq = st.selectbox(
+            "Rebalance frequency",
+            ["Quarterly", "Semi-annual", "Annual", "Threshold-only"],
+            index=0, key="rb_freq",
+            help="Scheduled rebalance cadence. Threshold-only means only drift triggers orders.",
+        )
+    with rb_col3:
+        tax_aware = st.toggle(
+            "Tax-aware ordering", value=True, key="rb_tax",
+            help="Prioritise selling long-term positions (>1yr) over short-term to minimise tax drag.",
+        )
+
+    # ── Last rebalance date (persisted) ────────────────────────────────────
+    st.components.v1.html("""
+    <script>
+    (function() {
+      const v = localStorage.getItem("aw_last_rebal");
+      if (v) {
+        const params = new URLSearchParams(window.parent.location.search);
+        if (params.get("last_rebal") !== v) {
+          params.set("last_rebal", v);
+          window.parent.history.replaceState(null, "", "?" + params.toString());
+        }
+      }
+    })();
+    </script>
+    """, height=0)
+
+    saved_last_rebal = st.query_params.get("last_rebal", "")
+    try:
+        last_rebal_date = datetime.strptime(saved_last_rebal, "%Y-%m-%d").date()
+    except Exception:
+        last_rebal_date = None
+
+    mark_col, date_col = st.columns([1, 3])
+    with mark_col:
+        mark_rebal = st.button("✓ Mark Rebalanced Today", key="mark_rebal_btn",
+                               use_container_width=True)
+    with date_col:
+        if last_rebal_date:
+            days_since = (datetime.today().date() - last_rebal_date).days
+            since_color = "#10b981" if days_since < 90 else "#f59e0b" if days_since < 180 else "#ef4444"
+            st.markdown(
+                f'<div style="font-family:var(--mono);font-size:0.72rem;padding-top:10px">'
+                f'Last rebalanced: <b style="color:{since_color}">{last_rebal_date}</b>'
+                f' &nbsp;·&nbsp; <span style="color:{since_color}">{days_since} days ago</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div style="font-family:var(--mono);font-size:0.72rem;color:var(--muted);'
+                'padding-top:10px">No rebalance date recorded — mark when complete.</div>',
+                unsafe_allow_html=True,
+            )
+
+    if mark_rebal:
+        today_str = datetime.today().strftime("%Y-%m-%d")
+        st.query_params["last_rebal"] = today_str
+        st.components.v1.html(
+            f'<script>localStorage.setItem("aw_last_rebal", "{today_str}");</script>',
+            height=0,
+        )
+        st.success(f"✓ Rebalance recorded for {today_str}.", icon="✓")
+        last_rebal_date = datetime.today().date()
+
+    st.markdown("<hr style='border-color:var(--border);margin:16px 0'>", unsafe_allow_html=True)
+
+    # ── Scheduled rebalance trigger check ──────────────────────────────────
+    freq_days = {"Quarterly": 90, "Semi-annual": 182, "Annual": 365,
+                 "Threshold-only": 9999}[rebal_freq]
+    days_since_rebal = (datetime.today().date() - last_rebal_date).days \
+                       if last_rebal_date else 9999
+    schedule_due     = days_since_rebal >= freq_days
+    next_rebal_date  = (last_rebal_date + timedelta(days=freq_days)
+                        if last_rebal_date else datetime.today().date())
+
+    # ── Build order list ────────────────────────────────────────────────────
+    # Priority:
+    #   1. Stop-loss triggered positions (immediate, always)
+    #   2. Positions breaching tolerance band
+    #   3. Scheduled rebalance positions (if due)
+
+    orders = []
+
+    for _, row in drift_edit.iterrows():
+        ticker     = row["Ticker"]
+        drift      = row["Drift %"]
+        target_pct = row["Target %"]
+        current_pct= row["Current %"]
+        px         = row["Live Price"]
+        shares     = row["Shares"]
+        cb         = row["Cost Basis"]
+        stopped    = row["Stopped"]
+        bucket     = row["Bucket"].replace(" ✏", "")
+
+        if px <= 0:
+            continue
+
+        # Dollar values
+        target_dollar  = total_inv * target_pct  / 100
+        current_dollar = total_inv * current_pct / 100
+        delta_dollar   = target_dollar - current_dollar   # positive = need to buy
+        delta_shares   = delta_dollar / px
+
+        # Hold period classification (from cost basis entry — proxy only)
+        # We don't have actual purchase date; classify as unknown unless
+        # user adds date. For now: if P&L% > 0 and > 20%, likely held >1yr
+        hold_class = "unknown"
+        if cb > 0 and px > 0:
+            pnl_pct = (px - cb) / cb * 100
+            if pnl_pct > 0:
+                hold_class = "gain — check hold period"
+            else:
+                hold_class = "loss — tax-loss harvest candidate"
+
+        # Determine trigger
+        is_stop    = bool(stopped)
+        is_thresh  = abs(drift) >= tolerance_band
+        is_sched   = schedule_due and abs(drift) > 1   # only if actually drifted
+
+        if not (is_stop or is_thresh or is_sched):
+            continue
+
+        if is_stop:
+            priority    = 0
+            trigger     = "🚨 STOP-LOSS"
+            action      = "SELL ALL"
+            order_shares= shares
+            order_dollar= shares * px
+            direction   = "SELL"
+        elif delta_dollar > 0:
+            priority    = 1 if is_thresh else 2
+            trigger     = f"⚠ DRIFT +{abs(drift):.1f}%" if is_thresh else "📅 SCHEDULED"
+            action      = "BUY"
+            order_shares= abs(delta_shares)
+            order_dollar= abs(delta_dollar)
+            direction   = "BUY"
+        else:
+            priority    = 1 if is_thresh else 2
+            trigger     = f"⚠ DRIFT −{abs(drift):.1f}%" if is_thresh else "📅 SCHEDULED"
+            action      = "SELL"
+            order_shares= abs(delta_shares)
+            order_dollar= abs(delta_dollar)
+            direction   = "SELL"
+
+        orders.append({
+            "priority":     priority,
+            "ticker":       ticker,
+            "bucket":       bucket,
+            "direction":    direction,
+            "trigger":      trigger,
+            "order_shares": round(order_shares, 2),
+            "order_dollar": round(order_dollar, 2),
+            "current_pct":  current_pct,
+            "target_pct":   target_pct,
+            "drift":        drift,
+            "px":           px,
+            "hold_class":   hold_class,
+            "is_stop":      is_stop,
+        })
+
+    orders.sort(key=lambda o: (o["priority"], -abs(o["drift"])))
+
+    # ── Schedule status banner ──────────────────────────────────────────────
+    if rebal_freq != "Threshold-only":
+        sched_color = "#ef4444" if schedule_due else "#10b981"
+        sched_label = "DUE NOW" if schedule_due else f"Next: {next_rebal_date}"
+        sched_msg   = (f"Scheduled {rebal_freq.lower()} rebalance is overdue."
+                       if schedule_due else
+                       f"{freq_days - days_since_rebal} days until next scheduled rebalance.")
+        st.markdown(
+            f'<div style="padding:10px 14px;background:rgba(255,255,255,0.03);'
+            f'border:1px solid {sched_color}44;border-radius:6px;margin-bottom:16px;'
+            f'display:flex;align-items:center;gap:12px">'
+            f'<span style="font-family:var(--mono);font-size:0.65rem;color:{sched_color};'
+            f'letter-spacing:1px">{rebal_freq.upper()} SCHEDULE: {sched_label}</span>'
+            f'<span style="font-size:0.72rem;color:var(--muted)">{sched_msg}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Order list ──────────────────────────────────────────────────────────
+    if not orders:
+        st.markdown(
+            f'<div style="padding:20px;text-align:center;color:var(--muted);'
+            f'font-family:var(--mono);font-size:0.8rem">'
+            f'✓ No orders required — all positions within {tolerance_band}% tolerance band'
+            f'{"" if not schedule_due else " (scheduled rebalance due but no material drift)"}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        # Column header
+        st.markdown(
+            '<div style="display:flex;gap:12px;padding:6px 0 8px;'
+            'border-bottom:1px solid var(--border);font-family:var(--mono);'
+            'font-size:0.58rem;color:var(--muted);letter-spacing:1px;text-transform:uppercase">'
+            '<div style="width:80px">Trigger</div>'
+            '<div style="width:50px">Ticker</div>'
+            '<div style="width:70px">Bucket</div>'
+            '<div style="width:60px">Action</div>'
+            '<div style="width:80px;text-align:right">Shares</div>'
+            '<div style="width:90px;text-align:right">$ Amount</div>'
+            '<div style="width:60px;text-align:right">@ Price</div>'
+            '<div style="flex:1">Drift → Target</div>'
+            '<div style="flex:1">Tax Note</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        for o in orders:
+            dir_color  = "#ef4444" if o["direction"] == "SELL" else "#3b82f6"
+            trig_color = "#ef4444" if o["is_stop"] else (
+                         "#f59e0b" if o["priority"] == 1 else "#64748b")
+            b_color    = {"Core": "#3b82f6", "Tactical": "#10b981",
+                          "Hedge": "#f59e0b"}.get(o["bucket"], "#64748b")
+
+            # Tax note — only show for sells
+            tax_note = ""
+            if o["direction"] == "SELL" and tax_aware:
+                if o["is_stop"]:
+                    tax_note = "Stop exit — check gain/loss"
+                elif "loss" in o["hold_class"]:
+                    tax_note = "🟢 Loss harvest opportunity"
+                elif "gain" in o["hold_class"]:
+                    tax_note = "⚠ Check hold period (ST vs LT)"
+                else:
+                    tax_note = "Hold period unknown"
+            elif o["direction"] == "BUY":
+                tax_note = "New cost basis on purchase"
+
+            st.markdown(
+                f'<div style="display:flex;gap:12px;align-items:center;padding:10px 0;'
+                f'border-bottom:1px solid var(--border)">'
+                f'<div style="width:80px;font-family:var(--mono);font-size:0.65rem;'
+                f'color:{trig_color}">{o["trigger"]}</div>'
+                f'<div style="width:50px;font-family:var(--mono);font-weight:700;'
+                f'font-size:0.82rem">{o["ticker"]}</div>'
+                f'<div style="width:70px;font-size:0.65rem;color:{b_color}">{o["bucket"]}</div>'
+                f'<div style="width:60px">'
+                f'<span style="background:{"rgba(239,68,68,0.12)" if o["direction"]=="SELL" else "rgba(59,130,246,0.12)"};'
+                f'color:{dir_color};font-family:var(--mono);font-size:0.68rem;'
+                f'padding:2px 7px;border-radius:3px;font-weight:700">{o["direction"]}</span>'
+                f'</div>'
+                f'<div style="width:80px;text-align:right;font-family:var(--mono);font-size:0.78rem">'
+                f'{o["order_shares"]:.2f}</div>'
+                f'<div style="width:90px;text-align:right;font-family:var(--mono);font-size:0.78rem;'
+                f'color:{dir_color}">${o["order_dollar"]:,.0f}</div>'
+                f'<div style="width:60px;text-align:right;font-family:var(--mono);font-size:0.72rem;'
+                f'color:var(--muted)">${o["px"]:.2f}</div>'
+                f'<div style="flex:1;font-size:0.7rem;color:var(--muted)">'
+                f'{o["current_pct"]:.1f}% → {o["target_pct"]:.1f}% '
+                f'<span style="color:{"#ef4444" if o["drift"]>0 else "#3b82f6"}">'
+                f'({o["drift"]:+.1f}%)</span></div>'
+                f'<div style="flex:1;font-size:0.68rem;color:var(--muted)">{tax_note}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        # Order summary totals
+        total_buy  = sum(o["order_dollar"] for o in orders if o["direction"] == "BUY")
+        total_sell = sum(o["order_dollar"] for o in orders if o["direction"] == "SELL")
+        net        = total_buy - total_sell
+
+        st.markdown(
+            f'<div style="margin-top:14px;padding:12px 16px;background:var(--surface2);'
+            f'border:1px solid var(--border);border-radius:6px;'
+            f'display:flex;gap:24px;font-family:var(--mono);font-size:0.75rem;flex-wrap:wrap">'
+            f'<span>Orders: <b>{len(orders)}</b></span>'
+            f'<span style="color:#3b82f6">Total buys: <b>${total_buy:,.0f}</b></span>'
+            f'<span style="color:#ef4444">Total sells: <b>${total_sell:,.0f}</b></span>'
+            f'<span style="color:{"#10b981" if net<=0 else "#f59e0b"}">'
+            f'Net cash {"freed" if net<=0 else "needed"}: <b>${abs(net):,.0f}</b></span>'
+            f'<span style="color:var(--muted);margin-left:auto;font-size:0.65rem">'
+            f'Tolerance band: ±{tolerance_band}% · {rebal_freq}'
+            f'{"· Tax-aware" if tax_aware else ""}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Methodology note ────────────────────────────────────────────────────
+    st.markdown(
+        '<div style="margin-top:14px;padding:12px 16px;background:rgba(59,130,246,0.06);'
+        'border:1px solid rgba(59,130,246,0.15);border-radius:6px;'
+        'font-size:0.72rem;color:var(--muted);line-height:1.6">'
+        '<b style="color:#3b82f6;font-family:var(--mono)">RULES</b> &nbsp;·&nbsp; '
+        'Stop-loss exits always execute immediately regardless of schedule. '
+        'Threshold triggers fire when any position drifts beyond the tolerance band. '
+        'Scheduled rebalances execute all positions with drift &gt;1%. '
+        'Share quantities are calculated at live price — re-verify before executing. '
+        'Tax notes are estimates only; consult a tax advisor for actual treatment. '
+        'Hold period tracking requires entering a purchase date (future feature).'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
 
 # ─── TAB 4 — GLIDE PATH ──────────────────────────────────────────────────────
 with tab4:
