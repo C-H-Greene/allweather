@@ -801,6 +801,116 @@ def compute_technical_sentiment(prices: pd.DataFrame, volumes: pd.DataFrame) -> 
     return results
 
 
+@st.cache_data(ttl=3600)
+def fetch_historical_prices(tickers: tuple, start_year: int) -> pd.DataFrame:
+    """Fetch long-period close prices for historical simulation."""
+    try:
+        start = f"{start_year}-01-01"
+        data  = yf.download(list(tickers), start=start, auto_adjust=True, progress=False)
+        if isinstance(data.columns, pd.MultiIndex):
+            df = data["Close"]
+        else:
+            df = data[["Close"]].rename(columns={"Close": list(tickers)[0]})
+        return df.ffill().dropna(how="all")
+    except Exception:
+        return pd.DataFrame()
+
+
+def run_portfolio_simulation(
+    prices:         pd.DataFrame,
+    weights:        dict,           # {ticker: weight}, must sum to 1.0
+    start_date:     pd.Timestamp,
+    end_date:       pd.Timestamp,
+    rebal_freq:     str = "QE",     # pandas offset: QE=quarterly, YE=annual
+    initial_value:  float = 100.0,
+) -> pd.DataFrame:
+    """
+    Simulate a static-weight portfolio with periodic rebalancing.
+
+    Returns a DataFrame with columns:
+        date, portfolio_value, daily_return, drawdown
+    """
+    px = prices.loc[start_date:end_date, list(weights.keys())].copy()
+    px = px.dropna(how="all").ffill()
+
+    if px.empty or len(px) < 2:
+        return pd.DataFrame()
+
+    # Keep only tickers with full coverage
+    available = {t: w for t, w in weights.items() if t in px.columns and not px[t].isna().all()}
+    if not available:
+        return pd.DataFrame()
+
+    # Renormalise weights for available tickers
+    total_w = sum(available.values())
+    w_norm  = {t: w / total_w for t, w in available.items()}
+
+    # Rebalance dates — quarterly or annual
+    rebal_dates = set(
+        pd.date_range(start=px.index[0], end=px.index[-1], freq=rebal_freq).map(
+            lambda d: px.index[px.index.searchsorted(d, side="left")]
+            if px.index.searchsorted(d, side="left") < len(px.index) else px.index[-1]
+        )
+    )
+    rebal_dates.add(px.index[0])
+
+    # Run simulation
+    portfolio_value = initial_value
+    shares = {t: (portfolio_value * w_norm[t]) / float(px[t].iloc[0])
+              for t in w_norm}
+    records = []
+
+    prev_val = portfolio_value
+    for i, date in enumerate(px.index):
+        # Current portfolio value
+        pv = sum(shares[t] * float(px.loc[date, t]) for t in shares if t in px.columns)
+
+        # Rebalance
+        if date in rebal_dates and i > 0:
+            for t in w_norm:
+                if t in px.columns:
+                    shares[t] = (pv * w_norm[t]) / float(px.loc[date, t])
+
+        daily_ret = (pv - prev_val) / prev_val if prev_val > 0 else 0.0
+        records.append({"date": date, "portfolio_value": pv, "daily_return": daily_ret})
+        prev_val = pv
+
+    df = pd.DataFrame(records).set_index("date")
+
+    # Drawdown
+    rolling_max = df["portfolio_value"].cummax()
+    df["drawdown"] = (df["portfolio_value"] - rolling_max) / rolling_max * 100
+
+    return df
+
+
+def compute_sim_stats(sim: pd.DataFrame, label: str) -> dict:
+    """Compute annualised performance statistics from a simulation DataFrame."""
+    if sim.empty:
+        return {"label": label, "cagr": None, "vol": None,
+                "sharpe": None, "max_dd": None, "calmar": None}
+
+    n_years = len(sim) / 252
+    total_r = sim["portfolio_value"].iloc[-1] / sim["portfolio_value"].iloc[0] - 1
+    cagr    = (1 + total_r) ** (1 / n_years) - 1 if n_years > 0 else 0
+    vol     = sim["daily_return"].std() * np.sqrt(252)
+    rf      = 0.04   # approximate risk-free rate
+    sharpe  = (cagr - rf) / vol if vol > 0 else 0
+    max_dd  = sim["drawdown"].min()
+    calmar  = cagr / abs(max_dd / 100) if max_dd < 0 else 0
+
+    return {
+        "label":  label,
+        "cagr":   round(cagr  * 100, 2),
+        "vol":    round(vol   * 100, 2),
+        "sharpe": round(sharpe, 2),
+        "max_dd": round(max_dd, 2),
+        "calmar": round(calmar, 2),
+        "start_val": round(sim["portfolio_value"].iloc[0],  2),
+        "end_val":   round(sim["portfolio_value"].iloc[-1], 2),
+    }
+
+
 def compute_volatility_weights(prices: pd.DataFrame) -> pd.Series:
     log_ret = np.log(prices / prices.shift(1)).dropna()
     vols    = log_ret.tail(30).std() * np.sqrt(252)
@@ -1075,6 +1185,266 @@ tactical_per_sector = tactical_alloc_pct / 3
 #   correlated. Positive correlation = regime instability / stress.
 # ══════════════════════════════════════════════════════════════════════════════
 
+def compute_transition_probability(
+    gdp_trend:      str,
+    cpi_trend:      str,
+    gdp_mom:        float,
+    cpi_mom:        float,
+    gdp_streak:     int,
+    cpi_streak:     int,
+    yc_signal:      str,
+    pmi_signal:     str,
+    claims_signal:  str,
+    leading_scores: list,
+    prices_all:     pd.DataFrame,
+) -> dict:
+    """
+    Estimate the probability that the current macro regime will transition
+    within the next 2–3 quarters, and which quadrant it is most likely to
+    transition into.
+
+    This is fundamentally different from the confidence gauge:
+      Confidence  = how well confirmed is the CURRENT regime?
+      Transition  = how likely is the current regime to CHANGE?
+
+    A regime can be high-confidence (clearly Expansion) but high-transition
+    (every leading indicator pointing toward Stagflation).
+
+    Signals used:
+      1. Leading indicator divergence from current regime (40%)
+         How many leading indicators disagree with the current GDP/CPI trend?
+      2. Rate of change of yield curve (20%)
+         A rapidly flattening/inverting curve is a stronger transition signal
+         than one that has been flat for a year.
+      3. Streak age vs empirical regime durations (20%)
+         Long streaks are statistically more likely to end.
+         US regime durations (post-WWII): Expansion ~14q, Recession ~3q,
+         Stagflation ~4q, Deflation ~2q.
+      4. Axis pressure (20%)
+         GDP and CPI momentum direction — are they decelerating even if
+         still positive? Cross-axis pressure signals impending flip.
+
+    Returns
+    -------
+    dict with:
+        prob_transition : float 0–100  overall transition probability
+        label           : str          LOW | MODERATE | ELEVATED | HIGH
+        color           : str          hex
+        target_probs    : dict         {quadrant: prob 0–100}  sums to ~100
+        top_target      : str          most likely destination quadrant
+        signals         : list of (name, score, detail) tuples
+        rationale       : str          plain-English explanation
+    """
+    # ── Historical median regime streak lengths (quarters) ────────────────
+    MEDIAN_DURATION = {
+        ("rising", "falling"): 14,   # Expansion
+        ("rising", "rising"):   4,   # Stagflation
+        ("falling","rising"):   3,   # Recession
+        ("falling","falling"):  2,   # Deflation
+    }
+    median_dur = MEDIAN_DURATION.get((gdp_trend, cpi_trend), 6)
+    min_streak = min(gdp_streak, cpi_streak)
+
+    # ── Signal 1: Leading indicator divergence ─────────────────────────────
+    # Each leading indicator gets compared to what the current regime predicts.
+    # Expansion predicts: yc positive, pmi expanding, claims improving
+    # Recession predicts: yc inverted, pmi contracting, claims deteriorating
+    # Stagflation predicts: yc flat/inverted, pmi mixed, claims worsening
+    # Deflation predicts: yc positive (flight to bonds), pmi contracting
+
+    expected_by_regime = {
+        ("rising", "falling"):  {"yc": 1,  "pmi": 1,  "claims": 1},   # Expansion
+        ("rising", "rising"):   {"yc": -1, "pmi": 0,  "claims": -1},  # Stagflation
+        ("falling","rising"):   {"yc": -1, "pmi": -1, "claims": -1},  # Recession
+        ("falling","falling"):  {"yc": 1,  "pmi": -1, "claims": 0},   # Deflation
+    }
+    expected = expected_by_regime.get((gdp_trend, cpi_trend),
+                                       {"yc": 0, "pmi": 0, "claims": 0})
+
+    actual = {
+        "yc":     leading_scores[0] if len(leading_scores) > 0 else 0,
+        "pmi":    leading_scores[1] if len(leading_scores) > 1 else 0,
+        "claims": leading_scores[2] if len(leading_scores) > 2 else 0,
+    }
+
+    divergence_scores = []
+    for key in ["yc", "pmi", "claims"]:
+        exp = expected[key]
+        act = actual[key]
+        if exp == 0:
+            # Regime has no strong expectation — any signal is mild pressure
+            divergence_scores.append(abs(act) * 0.5)
+        elif act == -exp:
+            # Direct contradiction — strong transition signal
+            divergence_scores.append(1.0)
+        elif act == exp:
+            # Confirms current regime
+            divergence_scores.append(0.0)
+        else:
+            # Mixed / neutral
+            divergence_scores.append(0.35)
+
+    divergence_sig = sum(divergence_scores) / 3.0   # 0–1
+
+    # ── Signal 2: Yield curve rate of change ──────────────────────────────
+    # We approximate this from the yc_signal: inverted > flat > normal
+    # A rapidly inverting curve (went from normal → inverted recently) is
+    # stronger than a curve that's been inverted for years.
+    yc_roc_sig = {
+        "inverted":   0.85,   # strongest recession/stagflation signal
+        "flat":       0.55,   # transition zone — watch closely
+        "steepening": 0.15,   # growth-positive, low transition risk
+        "normal":     0.10,   # stable growth, very low transition risk
+        "unknown":    0.40,   # no data — moderate default
+    }.get(yc_signal, 0.40)
+
+    # ── Signal 3: Streak age vs empirical duration ─────────────────────────
+    # Use a sigmoid-like function: low early, accelerating past median
+    if min_streak == 0:
+        streak_sig = 0.0
+    elif min_streak < median_dur * 0.5:
+        streak_sig = 0.1                              # young regime, very stable
+    elif min_streak < median_dur:
+        streak_sig = 0.3 + 0.3 * (min_streak / median_dur)  # approaching median
+    elif min_streak < median_dur * 1.5:
+        streak_sig = 0.65                             # past median, elevated
+    else:
+        streak_sig = min(0.90, 0.65 + (min_streak - median_dur * 1.5) * 0.05)
+
+    # ── Signal 4: Axis momentum pressure ──────────────────────────────────
+    # Are GDP and CPI decelerating even if still in the same direction?
+    # gdp_mom > 0 but small → GDP barely growing → risk of flip
+    gdp_pressure = max(0.0, min(1.0, 1.0 - abs(gdp_mom) / 1.5))
+    cpi_pressure = max(0.0, min(1.0, 1.0 - abs(cpi_mom) / 1.0))
+    axis_sig     = (gdp_pressure + cpi_pressure) / 2.0
+
+    # ── Blend ─────────────────────────────────────────────────────────────
+    prob_raw = (
+        0.40 * divergence_sig +
+        0.20 * yc_roc_sig     +
+        0.20 * streak_sig     +
+        0.20 * axis_sig
+    )
+    prob_transition = round(prob_raw * 100)
+
+    if prob_transition >= 65:
+        t_label, t_color = "HIGH",     "#ef4444"
+    elif prob_transition >= 45:
+        t_label, t_color = "ELEVATED", "#f59e0b"
+    elif prob_transition >= 25:
+        t_label, t_color = "MODERATE", "#3b82f6"
+    else:
+        t_label, t_color = "LOW",      "#10b981"
+
+    # ── Target quadrant probabilities ─────────────────────────────────────
+    # Which regime is it most likely transitioning INTO?
+    # Each possible destination gets a base weight from:
+    #   a) How much do leading indicators point toward it?
+    #   b) Is it adjacent to the current regime? (single-axis flips are more likely)
+
+    all_quads = [
+        ("rising",  "falling"),   # Expansion
+        ("rising",  "rising"),    # Stagflation
+        ("falling", "rising"),    # Recession
+        ("falling", "falling"),   # Deflation
+    ]
+    quad_names = {
+        ("rising",  "falling"): "🚀 Expansion",
+        ("rising",  "rising"):  "🔥 Stagflation",
+        ("falling", "rising"):  "❄️ Recession",
+        ("falling", "falling"): "🌧 Deflation",
+    }
+
+    raw_weights: dict = {}
+    for q in all_quads:
+        if q == (gdp_trend, cpi_trend):
+            raw_weights[q] = 0.0   # can't "transition" to current
+            continue
+
+        w = 0.0
+        q_gdp, q_cpi = q
+
+        # Adjacency: single-axis flip is ~3× more likely than diagonal
+        gdp_flip = q_gdp != gdp_trend
+        cpi_flip = q_cpi != cpi_trend
+        if gdp_flip and cpi_flip:
+            w += 0.5    # diagonal — rare but possible
+        else:
+            w += 1.5    # single-axis flip — much more common
+
+        # GDP axis signal
+        if gdp_flip:
+            # Does leading data support a GDP flip?
+            if q_gdp == "falling" and actual["pmi"] <= 0 and actual["claims"] <= 0:
+                w += 1.5
+            elif q_gdp == "rising" and actual["pmi"] >= 0 and actual["claims"] >= 0:
+                w += 1.5
+            else:
+                w += 0.3
+
+        # CPI axis signal
+        if cpi_flip:
+            # Yield curve and claims inform inflation direction
+            if q_cpi == "rising" and yc_signal in ("flat", "inverted"):
+                w += 0.8   # rising inflation often accompanies tightening
+            elif q_cpi == "falling" and yc_signal in ("steepening", "normal"):
+                w += 0.8
+            else:
+                w += 0.3
+
+        raw_weights[q] = max(0.0, w)
+
+    total_w = sum(raw_weights.values()) or 1.0
+    target_probs = {
+        quad_names[q]: round(raw_weights[q] / total_w * 100)
+        for q in all_quads if q != (gdp_trend, cpi_trend)
+    }
+    # Normalize to sum to (100 - "stay" probability)
+    stay_prob    = max(0, 100 - prob_transition)
+    target_total = sum(target_probs.values()) or 1
+    target_probs = {k: round(v / target_total * prob_transition)
+                    for k, v in target_probs.items()}
+
+    top_target = max(target_probs, key=target_probs.get) if target_probs else "Unknown"
+
+    # ── Rationale ─────────────────────────────────────────────────────────
+    if prob_transition >= 65:
+        rationale = (f"Multiple leading indicators contradict the current "
+                     f"{quad_names[(gdp_trend, cpi_trend)].split()[1]} regime. "
+                     f"A transition toward {top_target} appears likely "
+                     f"within 2–3 quarters.")
+    elif prob_transition >= 45:
+        rationale = (f"Leading indicators show elevated divergence from the "
+                     f"current regime. Watch for confirmation in next GDP/CPI prints. "
+                     f"{top_target} is the most probable destination.")
+    elif prob_transition >= 25:
+        rationale = (f"Some leading indicator pressure present but current regime "
+                     f"signals remain dominant. No immediate action required.")
+    else:
+        rationale = (f"Leading indicators broadly confirm current regime trajectory. "
+                     f"Transition risk is low for the next 2–3 quarters.")
+
+    return {
+        "prob_transition": prob_transition,
+        "label":           t_label,
+        "color":           t_color,
+        "target_probs":    target_probs,
+        "top_target":      top_target,
+        "stay_prob":       stay_prob,
+        "signals": [
+            ("Lead Divergence", round(divergence_sig * 100),
+             f"{sum(1 for s in divergence_scores if s > 0.5)}/3 indicators contradict current regime"),
+            ("Yield Curve",     round(yc_roc_sig * 100),
+             f"Signal: {yc_signal}"),
+            ("Streak Age",      round(streak_sig * 100),
+             f"{min_streak} periods vs median {median_dur}q for this regime"),
+            ("Axis Pressure",   round(axis_sig * 100),
+             f"GDP mom {gdp_mom:+.2f}% · CPI mom {cpi_mom:+.2f}%"),
+        ],
+        "rationale": rationale,
+    }
+
+
 def compute_regime_confidence(
     gdp_mom: float, cpi_mom: float,
     gdp_streak: int, cpi_streak: int,
@@ -1199,6 +1569,20 @@ regime_confidence = compute_regime_confidence(
     quad_preferred, sector_returns, prices_all,
     leading_bias   = _macro["leading_bias"],
     leading_scores = _macro["leading_scores"],
+)
+
+transition_probability = compute_transition_probability(
+    gdp_trend      = gdp_trend,
+    cpi_trend      = cpi_trend,
+    gdp_mom        = gdp_mom,
+    cpi_mom        = cpi_mom,
+    gdp_streak     = gdp_streak,
+    cpi_streak     = cpi_streak,
+    yc_signal      = _macro["yc_signal"],
+    pmi_signal     = _macro["pmi_signal"],
+    claims_signal  = _macro["claims_signal"],
+    leading_scores = _macro["leading_scores"],
+    prices_all     = prices_all,
 )
 
 
@@ -1409,7 +1793,90 @@ with col_regime:
         f'</div>',
         unsafe_allow_html=True,
     )
-    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Regime Transition Probability ─────────────────────────────────────
+    tp = transition_probability
+    st.markdown(
+        '<div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">'
+        '<div style="font-family:var(--mono);font-size:0.65rem;letter-spacing:1.5px;'
+        'text-transform:uppercase;color:var(--muted);margin-bottom:10px">'
+        '📈 Regime Transition Probability</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Main probability bar
+    tp_score = tp["prob_transition"]
+    tp_color = tp["color"]
+    tp_parts = [
+        f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">',
+        f'<div style="flex:1;height:10px;background:var(--surface2);border-radius:5px">',
+        f'<div style="height:100%;width:{tp_score}%;background:{tp_color};'
+        f'border-radius:5px;transition:width 0.5s"></div>',
+        f'</div>',
+        f'<div style="font-family:var(--mono);font-size:1rem;font-weight:700;'
+        f'color:{tp_color};width:40px;text-align:right">{tp_score}%</div>',
+        f'</div>',
+        f'<div style="font-family:var(--mono);font-size:0.7rem;color:{tp_color};'
+        f'margin-bottom:10px">Transition risk: <b>{tp["label"]}</b> · '
+        f'Stay probability: <b>{tp["stay_prob"]}%</b></div>',
+    ]
+    st.markdown("".join(tp_parts), unsafe_allow_html=True)
+
+    # Sub-signal breakdown
+    tp_sig_parts = ['<div style="margin-bottom:10px">']
+    for sig_name, sig_val, sig_detail in tp["signals"]:
+        s_col = "#ef4444" if sig_val >= 60 else ("#f59e0b" if sig_val >= 35 else "#10b981")
+        tp_sig_parts += [
+            '<div style="margin-bottom:5px">',
+            '<div style="display:flex;justify-content:space-between;'
+            'font-family:var(--mono);font-size:0.6rem;color:var(--muted);margin-bottom:2px">',
+            f'<span>{sig_name}</span><span style="color:{s_col}">{sig_val}</span>',
+            '</div>',
+            '<div style="height:3px;background:var(--surface2);border-radius:2px">',
+            f'<div style="height:100%;width:{sig_val}%;background:{s_col};border-radius:2px"></div>',
+            '</div>',
+            f'<div style="font-size:0.58rem;color:var(--muted);margin-top:1px">{sig_detail}</div>',
+            '</div>',
+        ]
+    tp_sig_parts.append('</div>')
+    st.markdown("".join(tp_sig_parts), unsafe_allow_html=True)
+
+    # Target quadrant distribution
+    st.markdown(
+        '<div style="font-family:var(--mono);font-size:0.6rem;color:var(--muted);'
+        'letter-spacing:1px;text-transform:uppercase;margin-bottom:6px">'
+        'If transition occurs — most likely destination:</div>',
+        unsafe_allow_html=True,
+    )
+    tp_dest_parts = ['<div style="display:flex;flex-direction:column;gap:4px;margin-bottom:8px">']
+    for quad_label, prob in sorted(tp["target_probs"].items(), key=lambda x: -x[1]):
+        bar_pct = prob
+        is_top  = quad_label == tp["top_target"]
+        d_color = tp_color if is_top else "var(--muted)"
+        tp_dest_parts += [
+            f'<div style="display:flex;align-items:center;gap:8px">',
+            f'<div style="font-family:var(--mono);font-size:0.68rem;'
+            f'color:{d_color};width:110px">{quad_label}</div>',
+            f'<div style="flex:1;height:5px;background:var(--surface2);border-radius:3px">',
+            f'<div style="height:100%;width:{bar_pct}%;background:{d_color};'
+            f'border-radius:3px;opacity:{"1" if is_top else "0.5"}"></div>',
+            f'</div>',
+            f'<div style="font-family:var(--mono);font-size:0.65rem;'
+            f'color:{d_color};width:30px;text-align:right">{prob}%</div>',
+            f'</div>',
+        ]
+    tp_dest_parts.append('</div>')
+    st.markdown("".join(tp_dest_parts), unsafe_allow_html=True)
+
+    # Rationale
+    st.markdown(
+        f'<div style="font-size:0.7rem;color:var(--muted);padding:8px 10px;'
+        f'background:rgba(255,255,255,0.02);border-radius:4px;line-height:1.5">'
+        f'{tp["rationale"]}</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown('</div>', unsafe_allow_html=True)   # close transition section
+    st.markdown('</div>', unsafe_allow_html=True)   # close aw-card
 
 
 
@@ -1476,12 +1943,13 @@ with col_hedge_info:
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📊  ALLOCATION ENGINE",
     "📈  SECTOR MOMENTUM",
     "⚖  DRIFT REPORT",
     "🗺  GLIDE PATH",
     "🔭  LEADING INDICATORS",
+    "📜  HISTORICAL VIEW",
 ])
 
 # ─── TAB 1 — ALLOCATION ENGINE ───────────────────────────────────────────────
@@ -3181,6 +3649,259 @@ with tab5:
     </div>
     """, unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ─── TAB 6 — HISTORICAL VIEW ─────────────────────────────────────────────────
+with tab6:
+    st.markdown('<div class="aw-card">', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="aw-card-title">📜 Historical Portfolio View — Illustrative Simulation</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown("""
+    <div style="font-size:0.78rem;color:var(--muted);margin-bottom:16px;line-height:1.6">
+      Simulates how a static-weight portfolio informed by this tool's core allocation
+      logic would have performed historically. Uses actual price data via yfinance.<br>
+      <b style="color:var(--accent3)">Important caveats:</b>
+      No tactical rotation is simulated (requires vintage macro data to avoid look-ahead bias).
+      No transaction costs or taxes. Weights held static with periodic rebalancing.
+      Past performance does not predict future results. This is illustration, not backtesting.
+    </div>
+    """, unsafe_allow_html=True)
+
+    h_col1, h_col2, h_col3, h_col4 = st.columns(4)
+    with h_col1:
+        sim_start_year = st.selectbox(
+            "Start year", [2000, 2005, 2010, 2015, 2018, 2020],
+            index=0, key="sim_start_year",
+        )
+    with h_col2:
+        sim_glide = st.selectbox(
+            "Portfolio (glide stage)", options=list(GLIDE_PRESETS.keys()),
+            index=0, key="sim_glide",
+        )
+    with h_col3:
+        sim_rebal = st.selectbox(
+            "Rebalance frequency", ["Quarterly", "Semi-annual", "Annual"],
+            index=0, key="sim_rebal",
+        )
+    with h_col4:
+        sim_initial = st.number_input(
+            "Starting value ($)", min_value=1000, max_value=1_000_000,
+            value=100_000, step=1000, key="sim_initial",
+        )
+
+    rebal_offset    = {"Quarterly": "QE", "Semi-annual": "2QE", "Annual": "YE"}[sim_rebal]
+    sim_core_assets = GLIDE_PRESETS[sim_glide]["assets"]
+    _tactical_proxy = quad_preferred[:3] if quad_preferred else ["XLK","XLY","XLF"]
+    _sim_tickers    = list(dict.fromkeys(
+        sim_core_assets + _tactical_proxy + ["VOO", "TLT", "IEF", "BIL", "SPY"]
+    ))
+
+    with st.spinner("Fetching historical data…"):
+        hist_prices = fetch_historical_prices(tuple(_sim_tickers), sim_start_year)
+
+    if hist_prices.empty:
+        st.warning("Historical data unavailable — this feature requires live yfinance access.", icon="⚠")
+    else:
+        start_dt = hist_prices.index[0]
+        end_dt   = hist_prices.index[-1]
+
+        _core_px = hist_prices[[t for t in sim_core_assets if t in hist_prices.columns]]
+        _core_w  = compute_volatility_weights(_core_px.tail(252))
+
+        _port_weights: dict = {}
+        core_frac     = core_pct     / 100
+        tactical_frac = tactical_pct / 100
+        hedge_frac    = hedge_pct    / 100
+
+        for t in _core_w.index:
+            _port_weights[t] = _port_weights.get(t, 0) + core_frac * float(_core_w[t])
+
+        _tac_available = [t for t in _tactical_proxy if t in hist_prices.columns]
+        if _tac_available:
+            per_tac = tactical_frac / len(_tac_available)
+            for t in _tac_available:
+                _port_weights[t] = _port_weights.get(t, 0) + per_tac
+
+        if "BIL" in hist_prices.columns:
+            _port_weights["BIL"] = _port_weights.get("BIL", 0) + hedge_frac
+
+        _tw = sum(_port_weights.values())
+        _port_weights = {t: w / _tw for t, w in _port_weights.items()}
+
+        _spy_w  = {"VOO": 1.0} if "VOO" in hist_prices.columns else {"SPY": 1.0}
+        _6040_w: dict = {}
+        if "VOO" in hist_prices.columns:   _6040_w["VOO"] = 0.60
+        if "TLT" in hist_prices.columns:   _6040_w["TLT"] = 0.40
+        elif "IEF" in hist_prices.columns: _6040_w["IEF"] = 0.40
+
+        sim_port  = run_portfolio_simulation(hist_prices, _port_weights, start_dt, end_dt,
+                                             rebal_freq=rebal_offset, initial_value=sim_initial)
+        sim_spy   = run_portfolio_simulation(hist_prices, _spy_w,  start_dt, end_dt,
+                                             rebal_freq=rebal_offset, initial_value=sim_initial)
+        sim_6040  = run_portfolio_simulation(hist_prices, _6040_w, start_dt, end_dt,
+                                             rebal_freq=rebal_offset, initial_value=sim_initial)
+
+        stats_port = compute_sim_stats(sim_port, f"All-Weather ({sim_glide.split('·')[0].strip()})")
+        stats_spy  = compute_sim_stats(sim_spy,  "S&P 500 (VOO)")
+        stats_6040 = compute_sim_stats(sim_6040, "60/40 (VOO/TLT)")
+
+        # Stats header
+        st.markdown(f"""
+        <div style="font-family:var(--mono);font-size:0.65rem;letter-spacing:2px;
+                    text-transform:uppercase;color:var(--muted);margin:16px 0 10px">
+          Performance Summary · {start_dt.year}–{end_dt.year} · {sim_rebal} rebalancing
+        </div>""", unsafe_allow_html=True)
+
+        st.markdown(
+            '<div style="display:flex;gap:8px;padding:6px 0 8px;border-bottom:1px solid var(--border);'
+            'font-family:var(--mono);font-size:0.6rem;color:var(--muted);letter-spacing:1px;text-transform:uppercase">'
+            '<div style="flex:2">Portfolio</div>'
+            '<div style="flex:1;text-align:right">CAGR</div>'
+            '<div style="flex:1;text-align:right">Ann Vol</div>'
+            '<div style="flex:1;text-align:right">Sharpe</div>'
+            '<div style="flex:1;text-align:right">Max DD</div>'
+            '<div style="flex:1;text-align:right">Calmar</div>'
+            '<div style="flex:1.5;text-align:right">Terminal Value</div>'
+            '</div>', unsafe_allow_html=True)
+
+        for i, s in enumerate([stats_port, stats_spy, stats_6040]):
+            if s["cagr"] is None: continue
+            c      = ["#3b82f6","#10b981","#f59e0b"][i]
+            cagr_c = "#10b981" if s["cagr"]  > 0    else "#ef4444"
+            dd_c   = "#ef4444" if s["max_dd"]< -20  else "#f59e0b" if s["max_dd"]< -10 else "#10b981"
+            shr_c  = "#10b981" if s["sharpe"]> 0.6  else "#f59e0b" if s["sharpe"]> 0.3 else "#ef4444"
+            tv_c   = "#10b981" if s["end_val"] > sim_initial else "#ef4444"
+            st.markdown(
+                f'<div style="display:flex;gap:8px;padding:10px 0;border-bottom:1px solid var(--border);align-items:center">'
+                f'<div style="flex:2;display:flex;align-items:center;gap:8px">'
+                f'<div style="width:3px;height:16px;background:{c};border-radius:2px"></div>'
+                f'<span style="font-size:0.78rem">{s["label"]}</span></div>'
+                f'<div style="flex:1;text-align:right;font-family:var(--mono);font-size:0.8rem;color:{cagr_c}">{s["cagr"]:+.1f}%</div>'
+                f'<div style="flex:1;text-align:right;font-family:var(--mono);font-size:0.8rem;color:var(--muted)">{s["vol"]:.1f}%</div>'
+                f'<div style="flex:1;text-align:right;font-family:var(--mono);font-size:0.8rem;color:{shr_c}">{s["sharpe"]:.2f}</div>'
+                f'<div style="flex:1;text-align:right;font-family:var(--mono);font-size:0.8rem;color:{dd_c}">{s["max_dd"]:.1f}%</div>'
+                f'<div style="flex:1;text-align:right;font-family:var(--mono);font-size:0.8rem;color:var(--muted)">{s["calmar"]:.2f}</div>'
+                f'<div style="flex:1.5;text-align:right;font-family:var(--mono);font-size:0.8rem;color:{tv_c}">${s["end_val"]:,.0f}</div>'
+                f'</div>', unsafe_allow_html=True)
+
+        # Equity curves
+        st.markdown(
+            '<div style="font-family:var(--mono);font-size:0.65rem;letter-spacing:2px;'
+            'text-transform:uppercase;color:var(--muted);margin:20px 0 10px">'
+            'Equity Curves (normalised to starting value)</div>', unsafe_allow_html=True)
+
+        def _sparkline_svg(sims, colors, labels, width=700, height=200):
+            pad_l, pad_r, pad_t, pad_b = 60, 50, 16, 32
+            w = width - pad_l - pad_r
+            h = height - pad_t - pad_b
+            series_norm, all_vals = [], []
+            for sim in sims:
+                if sim.empty:
+                    series_norm.append([]); continue
+                base = sim["portfolio_value"].iloc[0]
+                norm = (sim["portfolio_value"] / base * 100).tolist()
+                series_norm.append(norm); all_vals.extend(norm)
+            if not all_vals: return "<svg></svg>"
+            y_min  = max(0, min(all_vals) * 0.97)
+            y_max  = max(all_vals) * 1.02
+            y_span = y_max - y_min or 1
+            valid  = [s for s in sims if not s.empty]
+            if not valid: return "<svg></svg>"
+            longest = max(valid, key=len)
+            dates   = longest.index
+            parts   = [
+                f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" '
+                f'style="width:100%;max-width:{width}px;font-family:Space Mono,monospace">'
+            ]
+            for pct in [y_min, (y_min+y_max)/2, y_max]:
+                yp = pad_t + h - (pct - y_min) / y_span * h
+                parts += [
+                    f'<line x1="{pad_l}" y1="{yp:.1f}" x2="{pad_l+w}" y2="{yp:.1f}" stroke="#1e2535" stroke-width="1"/>',
+                    f'<text x="{pad_l-4}" y="{yp+4:.1f}" text-anchor="end" font-size="9" fill="#64748b">{pct:.0f}</text>',
+                ]
+            y100 = pad_t + h - (100 - y_min) / y_span * h
+            parts.append(f'<line x1="{pad_l}" y1="{y100:.1f}" x2="{pad_l+w}" y2="{y100:.1f}" stroke="#334155" stroke-width="1" stroke-dasharray="4,3"/>')
+            prev_yr = None
+            for i, d in enumerate(dates):
+                yr = d.year
+                if yr != prev_yr and yr % 2 == 0:
+                    x = pad_l + (i / max(len(dates)-1, 1)) * w
+                    parts.append(f'<text x="{x:.1f}" y="{height-4}" text-anchor="middle" font-size="9" fill="#64748b">{yr}</text>')
+                    prev_yr = yr
+            for vals, color, label in zip(series_norm, colors, labels):
+                if not vals: continue
+                m  = len(vals)
+                coords = [f'{pad_l + (i/max(m-1,1))*w:.1f},{pad_t + h - (v - y_min)/y_span*h:.1f}' for i,v in enumerate(vals)]
+                parts.append(f'<path d="M {" L ".join(coords)}" fill="none" stroke="{color}" stroke-width="1.8" opacity="0.9"/>')
+                ey = pad_t + h - (vals[-1] - y_min) / y_span * h
+                parts += [f'<text x="{pad_l+w+4}" y="{ey+4:.1f}" font-size="8" fill="{color}">{vals[-1]:.0f}</text>']
+            lx = pad_l
+            for color, label in zip(colors, labels):
+                parts += [
+                    f'<line x1="{lx}" y1="{pad_t-4}" x2="{lx+12}" y2="{pad_t-4}" stroke="{color}" stroke-width="2"/>',
+                    f'<text x="{lx+16}" y="{pad_t}" font-size="9" fill="#94a3b8">{label}</text>',
+                ]
+                lx += len(label) * 6 + 30
+            parts.append('</svg>')
+            return "".join(parts)
+
+        st.markdown(_sparkline_svg(
+            [sim_port, sim_spy, sim_6040],
+            ["#3b82f6","#10b981","#f59e0b"],
+            [f"All-Weather ({sim_glide.split('·')[0].strip()})", "S&P 500", "60/40"],
+        ), unsafe_allow_html=True)
+
+        # Drawdown
+        st.markdown(
+            '<div style="font-family:var(--mono);font-size:0.65rem;letter-spacing:2px;'
+            'text-transform:uppercase;color:var(--muted);margin:16px 0 8px">'
+            'Drawdown Profile</div>', unsafe_allow_html=True)
+
+        def _drawdown_svg(sims, colors, width=700, height=120):
+            pad_l, pad_r, pad_t, pad_b = 48, 16, 8, 24
+            w = width - pad_l - pad_r
+            h = height - pad_t - pad_b
+            all_dd = [v for s in sims if not s.empty for v in s["drawdown"].tolist()]
+            y_min  = min(all_dd) * 1.05 if all_dd else -50
+            y_span = abs(y_min) or 1
+            parts  = [
+                f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" '
+                f'style="width:100%;max-width:{width}px;font-family:Space Mono,monospace">'
+                f'<line x1="{pad_l}" y1="{pad_t}" x2="{pad_l+w}" y2="{pad_t}" stroke="#334155" stroke-width="1"/>'
+            ]
+            for pct in [0, y_min/2, y_min]:
+                yp = pad_t + (abs(pct) / y_span) * h
+                parts.append(f'<text x="{pad_l-4}" y="{yp+3:.1f}" text-anchor="end" font-size="8" fill="#64748b">{pct:.0f}%</text>')
+            for sim, color in zip(sims, colors):
+                if sim.empty: continue
+                dd = sim["drawdown"].tolist(); m = len(dd)
+                coords = [f'{pad_l + (i/max(m-1,1))*w:.1f},{pad_t + (abs(v)/y_span)*h:.1f}' for i,v in enumerate(dd)]
+                parts += [
+                    f'<path d="M {pad_l},{pad_t} L {" L ".join(coords)} L {pad_l+w},{pad_t}" fill="{color}" opacity="0.12"/>',
+                    f'<path d="M {" L ".join(coords)}" fill="none" stroke="{color}" stroke-width="1.2" opacity="0.8"/>',
+                ]
+            parts.append('</svg>')
+            return "".join(parts)
+
+        st.markdown(_drawdown_svg([sim_port, sim_spy, sim_6040], ["#3b82f6","#10b981","#f59e0b"]),
+                    unsafe_allow_html=True)
+
+        # Composition note
+        _wt_lines = [f"{t} {w*100:.1f}%" for t, w in sorted(_port_weights.items(), key=lambda x: -x[1]) if w > 0.005]
+        st.markdown(
+            f'<div style="margin-top:14px;padding:12px 16px;background:var(--surface2);'
+            f'border:1px solid var(--border);border-radius:6px;'
+            f'font-size:0.7rem;color:var(--muted);font-family:var(--mono)">'
+            f'<b style="color:var(--text)">Simulated weights:</b> {" · ".join(_wt_lines)}<br>'
+            f'<span style="font-size:0.65rem">Core: {core_pct}% inv-vol · '
+            f'Tactical: {tactical_pct}% static ({", ".join(_tac_available)}) · '
+            f'Hedge: {hedge_pct}% BIL · {sim_rebal} rebal · No costs · No taxes</span>'
+            f'</div>', unsafe_allow_html=True)
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
 
 
 
