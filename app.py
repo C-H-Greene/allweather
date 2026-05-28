@@ -60,7 +60,7 @@ st.components.v1.html("""
   }
 })();
 </script>
-""", height=0)
+""", height=1)
 
 # Read persisted values (or defaults) from query params
 _total_inv_default    = _qp("total_inv",    100_000)
