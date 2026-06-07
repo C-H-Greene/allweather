@@ -37,7 +37,7 @@ from engine  import (
     score_sectors, n_tilt_slots, regime_confidence,
     transition_probability, hedge_decision,
 )
-from screens import screen_hold, screen_outlook, screen_tracker
+import screen_hold, screen_outlook, screen_tracker
 
 # ── Inject styles ─────────────────────────────────────────────────────────────
 st.markdown(CSS, unsafe_allow_html=True)
