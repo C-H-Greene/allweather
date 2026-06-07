@@ -39,6 +39,10 @@ from engine  import (
 )
 import screen_hold, screen_outlook, screen_tracker
 
+# ── Inject styles ─────────────────────────────────────────────────────────────
+st.markdown(CSS, unsafe_allow_html=True)
+
+
 # ── Persistence helpers ───────────────────────────────────────────────────────
 def qp_get(key, default):
     val = st.query_params.get(key, str(default))
