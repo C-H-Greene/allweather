@@ -9,6 +9,14 @@ For styling: styles.py
 For screen content: screens/screen_*.py
 """
 
+import sys
+import os
+
+# Ensure the directory containing app.py is on sys.path so that
+# sibling modules (config, data, engine, styles, screens) are importable
+# regardless of where Streamlit Cloud sets the working directory.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import streamlit as st
 from datetime import timedelta
 import pandas as pd
@@ -29,7 +37,7 @@ from engine  import (
     score_sectors, n_tilt_slots, regime_confidence,
     transition_probability, hedge_decision,
 )
-import screen_hold, screen_outlook, screen_tracker
+from screens import screen_hold, screen_outlook, screen_tracker
 
 # ── Inject styles ─────────────────────────────────────────────────────────────
 st.markdown(CSS, unsafe_allow_html=True)
