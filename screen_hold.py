@@ -69,6 +69,17 @@ def render(
     )
 
     # ── Alerts ────────────────────────────────────────────────────────────────
+    if macro.get("source") == "demo":
+        st.markdown(
+            '<div class="aw-alert aw-alert-warn" role="status">'
+            '<span aria-hidden="true">⚠</span>'
+            '<span><b>FRED data unavailable</b> — macro signals showing estimated '
+            'mid-2024 baseline values. Price data and sector scoring are live. '
+            'Regime classification may not reflect current conditions.</span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
     if stopped:
         stops_str = ", ".join(stopped)
         st.markdown(
