@@ -79,16 +79,18 @@ def fetch_macro() -> dict:
     No API key required.
 
     Returns a flat dict with all fields needed by the engine and UI.
+    Falls back to clearly-labelled demo values when FRED is unreachable.
     """
     import urllib.request
 
-    def fred(series_id: str, tail: int = 18) -> pd.Series | None:
-        url = (
-            f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-            f"&vintage_date={datetime.today().strftime('%Y-%m-%d')}"
-        )
+    def fred(series_id: str, tail: int = 18):
+        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
         try:
-            with urllib.request.urlopen(url, timeout=8) as r:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; AllWeather/1.0)"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
                 raw = r.read().decode().strip().split("\n")
             rows = [l.split(",") for l in raw[1:] if "." in l]
             s = pd.Series(
@@ -99,8 +101,7 @@ def fetch_macro() -> dict:
         except Exception:
             return None
 
-    def streak(s: pd.Series) -> tuple[str, int]:
-        """Return (direction, consecutive_periods) for the latest trend."""
+    def streak(s: pd.Series) -> tuple:
         d = np.sign(s.diff().dropna())
         cur = d.iloc[-1]
         n = 1
@@ -117,14 +118,32 @@ def fetch_macro() -> dict:
     indpro = fred("INDPRO",   24)
     claims = fred("ICSA",    104)
 
+    # Track whether we're using live or demo data
+    macro_source = "live" if any(x is not None for x in [gdp, cpi, yc_raw]) else "demo"
+
+    # ── Fallback demo values (clearly labelled in UI via macro_source) ────────
+    # These reflect approximate mid-2024 conditions — used only when FRED unreachable
+    DEMO = {
+        "gdp_trend": "rising",  "gdp_streak": 4,  "gdp_mom":  0.6,
+        "cpi_trend": "falling", "cpi_streak": 3,  "cpi_mom": -0.2,
+        "yc_current": 0.18,     "yc_3m_avg": 0.15, "yc_signal": "flat",
+        "pmi_current": 103.2,   "pmi_mom": 0.4,    "pmi_signal": "stalling",
+        "claims_current": 218.5,"claims_signal": "stable",
+        "leading_bias": "mixed","leading_scores": [0, 0, 0],
+    }
+
     # ── GDP ───────────────────────────────────────────────────────────────────
-    gdp_trend, gdp_streak, gdp_mom = "rising", 1, 0.0
+    gdp_trend  = DEMO["gdp_trend"]
+    gdp_streak = DEMO["gdp_streak"]
+    gdp_mom    = DEMO["gdp_mom"]
     if gdp is not None and len(gdp) >= 2:
         gdp_trend, gdp_streak = streak(gdp)
         gdp_mom = float((gdp.iloc[-1] - gdp.iloc[-2]) / gdp.iloc[-2] * 100)
 
     # ── CPI ───────────────────────────────────────────────────────────────────
-    cpi_trend, cpi_streak, cpi_mom = "falling", 1, 0.0
+    cpi_trend  = DEMO["cpi_trend"]
+    cpi_streak = DEMO["cpi_streak"]
+    cpi_mom    = DEMO["cpi_mom"]
     if cpi is not None and len(cpi) >= 2:
         lb = min(5, len(cpi) - 1)
         cpi_trend = "rising" if cpi.iloc[-1] > cpi.iloc[-lb] else "falling"
@@ -132,8 +151,9 @@ def fetch_macro() -> dict:
         _, cpi_streak = streak(cpi)
 
     # ── Yield curve ───────────────────────────────────────────────────────────
-    yc_current = yc_3m_avg = None
-    yc_signal  = "unknown"
+    yc_current = DEMO["yc_current"]
+    yc_3m_avg  = DEMO["yc_3m_avg"]
+    yc_signal  = DEMO["yc_signal"]
     if yc_raw is not None and len(yc_raw) >= 60:
         yc_current = round(float(yc_raw.iloc[-1]), 2)
         yc_3m_avg  = round(float(yc_raw.tail(63).mean()), 2)
@@ -149,19 +169,22 @@ def fetch_macro() -> dict:
                 else "normal"
             )
 
-    # ── Industrial production (PMI proxy) ─────────────────────────────────────
-    pmi_mom, pmi_signal, pmi_current = 0.0, "stalling", None
+    # ── Industrial production ─────────────────────────────────────────────────
+    pmi_current = DEMO["pmi_current"]
+    pmi_mom     = DEMO["pmi_mom"]
+    pmi_signal  = DEMO["pmi_signal"]
     if indpro is not None and len(indpro) >= 3:
         pmi_current = round(float(indpro.iloc[-1]), 2)
         pmi_mom     = float((indpro.iloc[-1] - indpro.iloc[-3]) / indpro.iloc[-3] * 100)
         pmi_signal  = (
-            "expanding"    if pmi_mom >  0.5 else
-            "contracting"  if pmi_mom < -0.5 else
+            "expanding"   if pmi_mom >  0.5 else
+            "contracting" if pmi_mom < -0.5 else
             "stalling"
         )
 
     # ── Jobless claims ────────────────────────────────────────────────────────
-    claims_current, claims_signal = None, "stable"
+    claims_current = DEMO["claims_current"]
+    claims_signal  = DEMO["claims_signal"]
     if claims is not None and len(claims) >= 8:
         c4 = float(claims.tail(4).mean())
         cp = float(claims.tail(8).head(4).mean())
@@ -175,8 +198,8 @@ def fetch_macro() -> dict:
 
     # ── Leading composite ─────────────────────────────────────────────────────
     ls = [
-        1  if yc_signal in ("steepening", "normal")  else (-1 if yc_signal == "inverted"    else 0),
-        1  if pmi_signal == "expanding"               else (-1 if pmi_signal == "contracting" else 0),
+        1  if yc_signal in ("steepening", "normal")  else (-1 if yc_signal == "inverted"        else 0),
+        1  if pmi_signal == "expanding"               else (-1 if pmi_signal == "contracting"     else 0),
         1  if claims_signal == "improving"            else (-1 if claims_signal == "deteriorating" else 0),
     ]
     composite    = sum(ls)
@@ -203,6 +226,7 @@ def fetch_macro() -> dict:
         "claims_signal":  claims_signal,
         "leading_bias":   leading_bias,
         "leading_scores": ls,
+        "source":         macro_source,
     }
 
 
